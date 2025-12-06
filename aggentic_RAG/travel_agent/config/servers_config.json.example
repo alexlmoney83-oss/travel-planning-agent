@@ -1,0 +1,46 @@
+{
+    "mcp_servers": [
+        {
+            "name": "12306 Server",
+            "url": "https://your-12306-mcp-server-url/sse",
+            "description": "火车票查询服务 - 必需",
+            "required": true
+        },
+        {
+            "name": "Gaode Server",
+            "url": "https://your-gaode-mcp-server-url/sse",
+            "description": "高德地图服务（路线规划、酒店、天气、POI搜索）- 必需",
+            "required": true
+        },
+        {
+            "name": "bazi Server",
+            "url": "https://your-bazi-mcp-server-url/sse",
+            "description": "八字黄历服务（农历、黄历宜忌、出行吉日）- 必需",
+            "required": true
+        },
+        {
+            "name": "biying Server",
+            "url": "https://your-bing-mcp-server-url/sse",
+            "description": "必应搜索服务（搜索最新旅游资讯）- 可选",
+            "required": false
+        },
+        {
+            "name": "flight Server",
+            "url": "https://your-flight-mcp-server-url/sse",
+            "description": "航班查询服务 - 可选",
+            "required": false
+        }
+    ],
+    "agent": {
+        "name": "TravelPlannerAssistant",
+        "instructions": "你是一名专业的旅行规划智能助手。你可以帮助用户通过以下工具进行旅游规划：1) 12306查询 - 查询火车票信息；2) Gaode地图 - 路线规划和导航；3) 必应搜索 - 搜索最新旅游资讯；4) 八字工具 - 命理信息查询；5) 航班查询 - 查询航班信息。请根据用户需求调用相应工具，并生成详细的旅行方案。"
+    },
+    "_comment": {
+        "usage": "使用说明",
+        "step1": "复制此文件为 servers_config.json",
+        "step2": "将所有的 'your-xxx-mcp-server-url' 替换为真实的 MCP 服务器地址",
+        "step3": "必需的服务器（required: true）必须配置正确的 URL",
+        "step4": "可选的服务器（required: false）可以删除或保留占位符",
+        "note": "MCP 服务器 URL 通常以 /sse 结尾（Server-Sent Events）"
+    }
+}

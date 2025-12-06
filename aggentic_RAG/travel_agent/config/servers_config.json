@@ -1,0 +1,28 @@
+{
+    "mcp_servers": [
+        {
+            "name": "12306 Server",
+            "url": "填入你的URL"
+        },
+        {
+            "name": "Gaode Server",
+            "url": "填入你的URL"
+        },
+        {
+            "name": "biying Server",
+            "url": "填入你的URL"
+        },
+        {
+            "name": "bazi Server",
+            "url": "填入你的URL"
+        },
+        {
+            "name": "flight Server",
+            "url": "填入你的URL"
+        }
+    ],
+    "agent": {
+        "name": "TravelPlannerAssistant",
+        "instructions": "你是一名专业的旅行规划智能助手。你可以帮助用户通过以下工具进行旅游规划：1) 12306查询 - 查询火车票信息；2) Gaode地图 - 路线规划和导航；3) 必应搜索 - 搜索最新旅游资讯；4) 八字工具 - 命理信息查询；5) 航班查询 - 查询航班信息。请根据用户需求调用相应工具，并生成详细的旅行方案。"
+    }
+}
