@@ -1,6 +1,6 @@
 # 🌍 智能旅行规划助手
 
-基于 LangGraph + MCP + RAG 的 Agentic 旅行规划系统，结合多模型协作、知识检索和实时数据查询，为用户提供智能化的旅行方案。
+基于 LangGraph + MCP + RAG 的 Agentic 旅行规划系统，结合多模型协作、知识检索和实时数据查询，为用户提供智能化的旅行方案。也是自己制作的一个demo小项目
 
 ## 📋 目录
 
@@ -748,21 +748,11 @@ travel_workflow.add_edge("previous_node", "my_new_node")
 
 ---
 
-## 🙏 致谢
-
-- [LangChain](https://github.com/langchain-ai/langchain) - LLM 应用框架
-- [LangGraph](https://github.com/langchain-ai/langgraph) - 工作流编排
-- [ChromaDB](https://github.com/chroma-core/chroma) - 向量数据库
-- [DashScope](https://dashscope.aliyun.com/) - 阿里云模型服务
-- [DeepSeek](https://www.deepseek.com/) - DeepSeek R1 模型
-
----
-
 ## 📧 联系方式
 
-如有问题或建议，请提交 Issue 或联系项目维护者。
+该项目Created by Alex，如有问题或建议，请提交 Issue 或联系项目维护者。
 
-**项目地址**: [GitHub Repository URL]
+**项目地址**: [https://github.com/alexlmoney83-oss/travel-planning-agent]
 
 ---
 
