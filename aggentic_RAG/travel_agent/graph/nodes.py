@@ -18,11 +18,13 @@ from travel_agent.config.prompts import (
     PLANNER_SYSTEM_PROMPT,
     SIMPLE_QUERY_PROMPT_TEMPLATE,
     SYNTHESIZER_PROMPT_TEMPLATE,
+    REACT_THOUGHT_PROMPT,
+    REACT_OBSERVATION_PROMPT,
 )
 
 # Pydantic model for structured output
 class TravelPlanExtraction(BaseModel):
-    """Extracted travel plan information"""
+    """提取的旅行计划信息"""
     destination: str = Field(description="Destination city in Chinese")
     origin: str = Field(description="Origin city in Chinese")
     travel_days: int = Field(description="Number of travel days")
@@ -31,6 +33,7 @@ class TravelPlanExtraction(BaseModel):
     preferences: list[str] = Field(description="Travel preferences")
     needs_deep_analysis: bool = Field(default=False)
     tools_needed: list[str] = Field(default_factory=lambda: ["旅游攻略检索", "12306查询"])
+    is_appending: bool = Field(default=False, description="Whether this is appending to existing plan")
 
 # 初始化Qwen3 LLM（使用DashScope API）
 qwen3_llm = ChatOpenAI(
@@ -47,6 +50,192 @@ except Exception:
     # Fallback if structured output not supported
     qwen3_structured = None
     print("⚠️ Structured output not supported, using JSON parsing")
+
+# ========== 格式化辅助函数 ==========
+
+def format_travel_segments(segments: list) -> str:
+    """格式化行程段展示，支持返程段识别"""
+    if not segments:
+        return "无多段行程"
+    
+    result = []
+    segment_index = 1
+    
+    for i, seg in enumerate(segments):
+        origin = seg.get('origin', '未知')
+        dest = seg.get('destination', '未知')
+        days = seg.get('days', 0)
+        date = seg.get('date_start', '')
+        is_return = seg.get('is_return', False)
+        
+        if is_return:
+            # 返程段特殊处理
+            result.append(f"  返程：{origin} → {dest}")
+            if date:
+                result.append(f"    返程日期：{date}")
+            result.append(f"    提示：当天返回，请预留充裕时间")
+        else:
+            # 普通行程段
+            result.append(f"  第{segment_index}段：{origin} → {dest}")
+            result.append(f"    旅行时间：{days}天")
+            if date:
+                result.append(f"    出发日期：{date}")
+            segment_index += 1
+    
+    return "\n".join(result)
+
+def format_budget_allocation(budget_alloc: dict) -> str:
+    """格式化预算分配展示"""
+    if not budget_alloc:
+        return "未分配预算"
+    
+    result = []
+    total = sum(budget_alloc.values())
+    for city, amount in budget_alloc.items():
+        percentage = (amount / total * 100) if total > 0 else 0
+        result.append(f"  {city}：{amount}元 ({percentage:.1f}%)")
+    
+    return "\n".join(result)
+
+def format_risk_warnings(warnings: list) -> str:
+    """格式化风险警告展示"""
+    if not warnings:
+        return "无明显风险"
+    
+    result = []
+    for i, warning in enumerate(warnings, 1):
+        result.append(f"  {i}. ⚠️ {warning}")
+    
+    return "\n".join(result)
+
+def format_alternative_plans(plans: list) -> str:
+    """格式化替代方案展示"""
+    if not plans:
+        return "无替代方案"
+    
+    result = []
+    for plan in plans:
+        name = plan.get('name', '未命名方案')
+        desc = plan.get('description', '')
+        cost = plan.get('total_cost', 0)
+        pros = plan.get('pros', [])
+        cons = plan.get('cons', [])
+        
+        result.append(f"\n● **{name}**（总计约{cost}元）")
+        if desc:
+            result.append(f"  {desc}")
+        if pros:
+            result.append(f"  ✅ 优点：{', '.join(pros)}")
+        if cons:
+            result.append(f"  ⚠️ 缺点：{', '.join(cons)}")
+    
+    return "\n".join(result)
+
+def format_value_comparison(comparisons: list) -> str:
+    """格式化性价比对比展示"""
+    if not comparisons:
+        return "无对比数据"
+    
+    result = []
+    for comp in comparisons:
+        seg_idx = comp.get('segment', 0)
+        dest = comp.get('destination', '未知')
+        score = comp.get('value_score', 'N/A')
+        highlights = comp.get('highlights', [])
+        concerns = comp.get('concerns', [])
+        
+        result.append(f"\n  段{seg_idx + 1} - {dest} (性价比: {score})")
+        if highlights:
+            result.append(f"    🌟 亮点：{', '.join(highlights)}")
+        if concerns:
+            result.append(f"    ⚠️ 关注：{', '.join(concerns)}")
+    
+    return "\n".join(result)
+
+# ========== 业务逻辑函数 ==========
+
+def detect_multi_destination(user_query: str, extraction: dict) -> dict:
+    """检测是否为多目的地场景（排除往返/回程误判）
+    
+    Args:
+        user_query: 用户原始查询
+        extraction: Planner提取的结果
+    
+    Returns:
+        dict: {
+            'is_multi_destination': bool,
+            'detected_keywords': List[str],
+            'raw_destination_text': str
+        }
+    """
+    # === 1) 优先排除往返场景 ===
+    roundtrip_keywords = ["往返", "来回", "回程", "返程", "返回"]
+    if any(kw in user_query for kw in roundtrip_keywords):
+        print("  🔄 检测到往返关键词，不算多目的地")
+        return {
+            'is_multi_destination': False,
+            'detected_keywords': [],
+            'raw_destination_text': extraction.get('destination', ''),
+            'detection_method': 'roundtrip_excluded'
+        }
+    
+    # === 2) 多目的地关键词 ===
+    multi_dest_keywords = [
+        "再去", "然后去", "接着去", "顺便去",
+        "再到", "然后到", "接着到",
+        "再去看看", "再看看",
+        "之后去", "之后到"
+    ]
+    detected_keywords = [kw for kw in multi_dest_keywords if kw in user_query]
+    if detected_keywords:
+        return {
+            'is_multi_destination': True,
+            'detected_keywords': detected_keywords,
+            'raw_destination_text': extraction.get('destination', ''),
+            'detection_method': 'keyword'
+        }
+    
+    # === 3) 目的地字段中包含多个城市（逗号/顿号分隔） ===
+    destination = extraction.get('destination', '') or ''
+    origin = extraction.get('origin', '') or ''
+    norm = destination.replace(',', '，').replace('、', '，')
+    cities = [c.strip() for c in norm.split('，') if c.strip()]
+    # 去重保持顺序
+    unique_cities = []
+    for c in cities:
+        if c not in unique_cities:
+            unique_cities.append(c)
+    
+    if len(unique_cities) >= 3:
+        return {
+            'is_multi_destination': True,
+            'detected_keywords': [],
+            'raw_destination_text': destination,
+            'detection_method': 'comma_separated_3plus'
+        }
+    
+    if len(unique_cities) == 2:
+        # 如果两个城市中包含出发地，通常是往返（例如 上海, 南京）→ 视为单目的地
+        if origin and origin in unique_cities:
+            return {
+                'is_multi_destination': False,
+                'detected_keywords': [],
+                'raw_destination_text': destination,
+                'detection_method': 'origin_pair_excluded'
+            }
+        # 两个且都不是出发地 → 多目的地
+        return {
+            'is_multi_destination': True,
+            'detected_keywords': [],
+            'raw_destination_text': destination,
+            'detection_method': 'comma_separated_2'
+        }
+    
+    return {
+        'is_multi_destination': False,
+        'detected_keywords': [],
+        'raw_destination_text': destination
+    }
 
 async def planner_node(state: TravelPlanState) -> Dict[str, Any]:
     """规划节点 - 分析用户需求"""
@@ -175,6 +364,51 @@ async def planner_node(state: TravelPlanState) -> Dict[str, Any]:
             print(f"  偏好: {result['preferences']}")
             print(f"{'='*60}\n")
             
+            # ==== 检测多目的地场景 ====
+            # 注意：只在确实检测到多目的地关键词时才强制调用R1
+            # 避免 Qwen3 误判普通单目的地为 needs_deep_analysis=true
+            
+            # ==== 禁用对话追加功能 ====
+            # 如果检测到目的地变化，直接清空开始新查询
+            prev_destination = state.get("destination", "")
+            
+            # 如果目的地变化，清空所有历史，开始全新查询
+            if prev_destination and prev_destination != result.get('destination'):
+                print(f"  🔄 目的地变化: {prev_destination} → {result.get('destination')}")
+                print(f"  ⚒️ 对话追加功能已禁用，清空历史开始新查询")
+                
+                # 清空所有历史数据
+                result['rag_results'] = None
+                result['train_info'] = None
+                result['driving_info'] = None
+                result['flight_info'] = None
+                result['hotel_info'] = None
+                result['weather_info'] = None
+                result['lucky_day_info'] = None
+                result['travel_segments'] = None
+                result['r1_plan'] = None
+                result['iteration_count'] = 0
+                result['is_complete'] = False
+                result['should_continue'] = True
+            
+            # 正常单次查询的多目的地检测
+            multi_dest_detection = detect_multi_destination(user_query, result)
+            if multi_dest_detection.get('is_multi_destination', False):
+                print(f"  🌍 检测到多目的地场景！")
+                print(f"    关键词: {multi_dest_detection.get('detected_keywords', [])}")
+                print(f"    原始目的地文本: {multi_dest_detection.get('raw_destination_text', '')}")
+                # 只有真正检测到关键词时才强制设置
+                result['needs_deep_analysis'] = True
+                result['scenario_type'] = 'multi_destination'
+                result['raw_destination_text'] = multi_dest_detection.get('raw_destination_text', result['destination'])
+            else:
+                # 单目的地：保持 Qwen3 原始判断，但强制设置 needs_deep_analysis=False
+                # 避免 Qwen3 误判普通场景为复杂场景
+                if result.get('needs_deep_analysis', False):
+                    print(f"  ⚠️ Qwen3 设置 needs_deep_analysis=True，但未检测到多目的地关键词，强制设为False")
+                result['needs_deep_analysis'] = False
+                result['scenario_type'] = 'simple'
+            
             # ==== 智能判断查询模式 ====
             # 简单查询：只有目的地，没有旅行天数/预算/日期
             is_simple_query = (
@@ -212,6 +446,28 @@ async def planner_node(state: TravelPlanState) -> Dict[str, Any]:
                     "clarification_question": clarification,
                     "messages": [status_msg, AIMessage(content=clarification)],
                 }
+            
+            # ==== 检测目的地是否变化，清空旧数据 ====
+            # 注意：如果是追加场景，不清空历史数据，保留给R1分析
+            destination_changed = prev_destination and prev_destination != result['destination']
+            
+            if destination_changed and not is_appending:
+                print(f"  🔄 检测到目的地变化: {prev_destination} → {result['destination']}")
+                print(f"  🧹 清空旧的查询结果...")
+                # 清空所有查询结果
+                result['rag_results'] = None
+                result['train_info'] = None
+                result['driving_info'] = None
+                result['flight_info'] = None
+                result['hotel_info'] = None
+                result['weather_info'] = None
+                result['lucky_day_info'] = None
+                # 重置迭代计数
+                result['iteration_count'] = 0
+                result['is_complete'] = False
+                result['should_continue'] = True
+            elif is_appending:
+                print(f"  📦 追加场景：保留历史数据 ({prev_destination}) 供 R1 分析")
             
             # 信息完整，清除之前的 clarification 标记
             return {
@@ -593,15 +849,12 @@ async def train_query_node(state: TravelPlanState) -> Dict[str, Any]:
         except Exception as e:
             print(f"  ❌ 站点代码查询异常: {e}")
         
-        # 查询车次 - 必须使用 station_code
+        # 查询车次 - 优先使用 station_code，如果失败则尝试城市名
         print(f"  步骤 2: 查询车次")
         result = None
         
-        if not from_code or not to_code:
-            print(f"  ❌ 站点代码缺失，无法查询车票")
-            result = f"MCP error: Unable to get station codes for {origin} and {destination}"
-        else:
-            # 使用正确的参数名称（根据 schema）
+        if from_code and to_code:
+            # 使用站点代码查询（最佳方式）
             try:
                 print(f"  使用站点代码: fromStation={from_code}, toStation={to_code}, date={travel_date}")
                 result = await manager.call_tool(
@@ -612,12 +865,56 @@ async def train_query_node(state: TravelPlanState) -> Dict[str, Any]:
                     date=travel_date
                 )
                 if result and "MCP error" not in str(result):
-                    print(f"  ✅ 查询成功")
+                    print(f"  ✅ 使用站点代码查询成功")
                 else:
-                    print(f"  ❌ 查询失败: {str(result)[:200]}")
+                    print(f"  ⚠️ 站点代码查询失败: {str(result)[:200]}")
+                    result = None  # 重置结果，尝试备选方案
             except Exception as e:
-                print(f"  ❌ 查询异常: {e}")
-                result = f"MCP error: {str(e)}"
+                print(f"  ⚠️ 站点代码查询异常: {e}")
+                result = None
+        
+        # 如果站点代码查询失败，尝试使用城市名直接查询（备选方案）
+        if not result:
+            print(f"  步骤 2.1: 尝试使用城市名直接查询")
+            try:
+                # 尝试多种参数组合
+                param_combinations = [
+                    {"fromStation": origin, "toStation": destination, "date": travel_date},
+                    {"from": origin, "to": destination, "date": travel_date},
+                    {"departure": origin, "arrival": destination, "date": travel_date},
+                ]
+                
+                for params in param_combinations:
+                    try:
+                        print(f"  尝试参数: {params}")
+                        result = await manager.call_tool(
+                            "12306 Server",
+                            "get-tickets",
+                            **params
+                        )
+                        if result and "MCP error" not in str(result) and "error" not in str(result).lower():
+                            print(f"  ✅ 使用城市名查询成功")
+                            break
+                        else:
+                            print(f"  ⚠️ 参数 {list(params.keys())} 失败")
+                            result = None
+                    except Exception as param_err:
+                        print(f"  ⚠️ 参数 {list(params.keys())} 异常: {param_err}")
+                        continue
+            except Exception as e:
+                print(f"  ❌ 城市名查询异常: {e}")
+        
+        # 如果所有尝试都失败，返回详细错误信息
+        if not result:
+            print(f"  ❌ 所有查询方式都失败")
+            result = {
+                "error": "无法查询火车票信息",
+                "reason": f"站点代码查询失败（fromStation={from_code or '空'}/toStation={to_code or '空'}）",
+                "from_city": origin,
+                "to_city": destination,
+                "date": travel_date,
+                "suggestion": f"请直接访问 12306 官网（www.12306.cn）或 APP 查询 {origin} 到 {destination} 的车次"
+            }
         
         print(f"📦 MCP 返回结果类型: {type(result)}")
         print(f"📦 MCP 返回内容: {result[:500] if isinstance(result, str) else result}")
@@ -712,34 +1009,126 @@ async def train_query_node(state: TravelPlanState) -> Dict[str, Any]:
                     elif driving_result and "MCP error" not in str(driving_result):
                         print(f"  ✅ 自驾路线查询成功")
                         
-                        # 解析距离，判断是否适合自驾
+                        # 解析距离，保留所有数据并添加警告（不丢弃数据）
                         try:
                             import json
                             driving_data = json.loads(driving_result) if isinstance(driving_result, str) else driving_result
-                            print(f"  📊 完整路线数据: {json.dumps(driving_data, ensure_ascii=False, indent=2)[:500]}")
                             
-                            # 提取距离（可能在不同字段）
+                            # 🔍 详细调试：打印完整数据结构
+                            print(f"\n  🔍 高德自驾返回数据结构调试:")
+                            print(f"  数据类型: {type(driving_data)}")
+                            
+                            # 高德可能返回数组格式
+                            if isinstance(driving_data, list):
+                                print(f"  数组长度: {len(driving_data)}")
+                                print(f"  第一个元素: {driving_data[0] if driving_data else 'N/A'}")
+                            elif isinstance(driving_data, dict):
+                                print(f"  顶层字段: {list(driving_data.keys())}")
+                            
+                            print(f"  完整数据 (JSON): {json.dumps(driving_data, ensure_ascii=False, indent=2)[:1000]}")
+                            
+                            # 提取距离（支持数组和dict格式）
                             distance_km = None
-                            if isinstance(driving_data, dict):
-                                # 尝试多种可能的字段
-                                distance_m = (driving_data.get('distance') or 
-                                            driving_data.get('route', {}).get('distance') or
-                                            driving_data.get('paths', [{}])[0].get('distance'))
-                                if distance_m:
-                                    distance_km = float(distance_m) / 1000
-                                    print(f"  📏 距离: {distance_km:.1f} km")
                             
-                            if distance_km and distance_km < 300:
-                                print(f"  ✅ 距离 {distance_km:.0f}km < 300km，适合自驾，保留路线信息")
-                            elif distance_km:
-                                print(f"  ⚠️ 距离 {distance_km:.0f}km > 300km，不推荐自驾")
-                                driving_result = None
+                            # 方法0: 如果是数组，累加所有 distance
+                            if isinstance(driving_data, list):
+                                print(f"\n  🔎 检测到数组格式，累加所有 distance:")
+                                total_distance_m = 0
+                                for i, segment in enumerate(driving_data):
+                                    seg_dist = segment.get('distance')
+                                    if seg_dist:
+                                        try:
+                                            total_distance_m += float(seg_dist)
+                                            print(f"    [{i}] distance = {seg_dist}m")
+                                        except (ValueError, TypeError):
+                                            pass
+                                if total_distance_m > 0:
+                                    distance_km = total_distance_m / 1000
+                                    print(f"  ✅ 累计距离: {distance_km:.1f} km")
+                            elif isinstance(driving_data, dict):
+                                # 尝试多种可能的字段
+                                print(f"\n  🔎 尝试提取距离:")
+                                
+                                # 方法1: 直接 distance
+                                distance_m = driving_data.get('distance')
+                                print(f"    driving_data.get('distance') = {distance_m}")
+                                
+                                # 方法2: route.distance
+                                if not distance_m and 'route' in driving_data:
+                                    distance_m = driving_data.get('route', {}).get('distance')
+                                    print(f"    route.distance = {distance_m}")
+                                
+                                # 方法3: paths[0].distance
+                                if not distance_m and 'paths' in driving_data:
+                                    paths = driving_data.get('paths', [])
+                                    if paths and len(paths) > 0:
+                                        distance_m = paths[0].get('distance')
+                                        print(f"    paths[0].distance = {distance_m}")
+                                
+                                # 方法4: return.paths[0].distance (高德MCP可能用 return 包裹)
+                                if not distance_m and 'return' in driving_data:
+                                    ret_data = driving_data.get('return', {})
+                                    if isinstance(ret_data, dict) and 'route' in ret_data:
+                                        distance_m = ret_data.get('route', {}).get('distance')
+                                        print(f"    return.route.distance = {distance_m}")
+                                    elif isinstance(ret_data, dict) and 'paths' in ret_data:
+                                        paths = ret_data.get('paths', [])
+                                        if paths and len(paths) > 0:
+                                            distance_m = paths[0].get('distance')
+                                            print(f"    return.paths[0].distance = {distance_m}")
+                                
+                                if distance_m:
+                                    try:
+                                        distance_km = float(distance_m) / 1000
+                                        print(f"  ✅ 成功提取距离: {distance_km:.1f} km")
+                                    except (ValueError, TypeError) as e:
+                                        print(f"  ⚠️ 距离转换失败: {distance_m}, 错误: {e}")
+                                else:
+                                    print(f"  ❌ 未找到距离字段")
+                            
+                            # 根据距离添加警告，但始终保留数据
+                            if distance_km:
+                                if distance_km < 300:
+                                    print(f"  ✅ 距离 {distance_km:.0f}km < 300km，适合自驾")
+                                    # 保留原始数据，不需警告
+                                    driving_result = {
+                                        "data": driving_data,
+                                        "distance_km": distance_km,
+                                        "suitable": True
+                                    }
+                                elif distance_km < 500:
+                                    print(f"  ⚠️ 距离 {distance_km:.0f}km (300-500km)，自驾较累，但可行")
+                                    driving_result = {
+                                        "data": driving_data,
+                                        "distance_km": distance_km,
+                                        "warning": f"距离较远（{distance_km:.0f}km），自驾需要 {int(distance_km/80)+1} 小时以上，请考虑体力和时间",
+                                        "suitable": False
+                                    }
+                                else:  # > 500km
+                                    print(f"  🚗✈️ 距离 {distance_km:.0f}km > 500km，强烈建议高铁/飞机")
+                                    driving_result = {
+                                        "data": driving_data,
+                                        "distance_km": distance_km,
+                                        "warning": f"距离很远（{distance_km:.0f}km），自驾需要 {int(distance_km/80)+1} 小时以上，强烈建议选择高铁或飞机",
+                                        "suitable": False
+                                    }
                             else:
                                 print(f"  ⚠️ 无法提取距离信息，保留原始数据")
+                                # 仍然保留数据，只是没有距离信息
+                                driving_result = {
+                                    "data": driving_data,
+                                    "warning": "无法提取距离信息，请自行判断是否适合自驾"
+                                }
                         except Exception as parse_err:
                             print(f"  ⚠️ 解析距离失败: {parse_err}")
                             import traceback
                             traceback.print_exc()
+                            # 即使解析失败，也保留原始数据
+                            if driving_result:
+                                driving_result = {
+                                    "data": driving_result,
+                                    "warning": "数据解析失败，请自行判断"
+                                }
                 except Exception as driving_err:
                     print(f"  ❌ 自驾路线查询异常: {driving_err}")
                     driving_result = None
@@ -1075,6 +1464,490 @@ async def weather_query_node(state: TravelPlanState) -> Dict[str, Any]:
         }
 
 
+async def r1_strategy_node(state: TravelPlanState) -> Dict[str, Any]:
+    """
+R1战略规划节点 - 分解多段行程并制定查询计划
+    
+    这是R1的第一次介入，负责：
+    1. 理解用户的完整意图（识别多段行程）
+    2. 分解旅行段（起点、终点、天数、日期）
+    3. 分配预算给每一段
+    4. 制定详细的查询计划（工具、参数、顺序）
+    """
+    from travel_agent.tools.r1_tool import get_r1_instance
+    from datetime import datetime, timedelta
+    
+    print(f"\n{'='*60}")
+    print("▶️ R1 Strategy 节点开始执行")
+    
+    user_query = state.get('user_query', '')
+    scenario_type = state.get('scenario_type', 'multi_destination')
+    scenario_label = "单目的地复杂行程" if scenario_type != "multi_destination" else "多段行程"
+    status_msg = AIMessage(content=f"🧐 正在智能分析您的{scenario_label}，规划最佳路线…")
+    
+    # 收集Qwen3提取的初步信息
+    destination = state.get('destination', '')
+    origin = state.get('origin', '')
+    travel_days = state.get('travel_days', 0)
+    budget = state.get('budget', 0)
+    travel_date = state.get('travel_date', '')
+    preferences = state.get('preferences', [])
+    raw_destination_text = state.get('raw_destination_text', destination)
+    
+    print(f"  场景类型: {scenario_type}")
+    print(f"  用户查询: {user_query[:80]}...")
+    print(f"  Qwen3提取的目的地: {destination}")
+    print(f"  原始目的地文本: {raw_destination_text}")
+    
+    # 提取对话历史（只提取用户消息）
+    conversation_messages = state.get('messages', [])
+    user_messages = []
+    for msg in conversation_messages:
+        if isinstance(msg, HumanMessage):
+            user_messages.append(msg.content)
+        elif isinstance(msg, dict) and (msg.get('type') == 'human' or msg.get('role') == 'user'):
+            user_messages.append(msg.get('content', ''))
+    
+    conversation_context = ""
+    if len(user_messages) > 1:
+        conversation_context = f"""
+
+💬 **对话历史**（用户的多轮查询）：
+{chr(10).join([f"{i+1}. {msg}" for i, msg in enumerate(user_messages)])}
+
+⚠️ 请根据完整的对话历史理解用户意图，分解出完整的多段行程。
+"""
+        print(f"  对话历史: {len(user_messages)}轮")
+    
+    problem = f"""
+用户的旅行需求：
+最新查询：{user_query}
+{conversation_context}
+
+Qwen3已提取的初步信息：
+- 目的地（可能是多个）：{raw_destination_text}
+- 出发地：{origin}
+- 总天数：{travel_days}
+- 总预算：{budget}元
+- 出发日期：{travel_date}
+- 偏好：{', '.join(preferences) if preferences else '无'}
+
+场景类型：{scenario_type}
+
+你的任务：
+1. **理解完整意图**：分析用户是否想去多个城市，识别每一段行程的起点和终点。
+   - ⚠️ 注意：往返行程（如“上海→南京→上海”）不算多目的地，只算南京一个目的地。
+   - ⚠️ 只有当用户明确表达“再去/然后去/接着去/之后到”等意图时，才判定为多目的地。
+2. **分解行程段**：
+   - 每段包括：origin（出发城市）、destination（目的地城市）、days（天数）、date_start（开始日期 YYYY-MM-DD）
+   - 注意：第2段的origin应该是第1段的destination（连续行程）
+   - ⚠️ 不要把“回程/返程/返回”单独拆成一段，它只是交通返回，不是新的目的地。
+3. **预算分配**：根据每段的天数和目的地物价水平，分配总预算给所有段（budget_allocation 总和应等于总预算）
+4. **制定查询计划**：为每一段制定需要查询的工具和参数
+
+✨ **query_plan 建议**（无步骤限制！） ✨
+系统已迁移到LangChain Agent，没有任何步骤限制，你可以自由规划！
+
+【单目的地场景】
+- ✅ **无步骤限制**：想查多少步都可以！
+- 建议包含：rag_search + train_query + flight_query + gaode_hotel_search + gaode_weather + lucky_day + gaode_driving + 返程交通
+- 优先级：rag_search > train_query > gaode_hotel_search > gaode_weather > lucky_day
+- 可以同时查询多种交通方式（高铁+航班+自驾）进行对比
+
+【多目的地场景】
+- ✅ **无步骤限制**：想查多少步都可以！
+- 建议每个目的地查询：rag_search + train_query + gaode_hotel_search + gaode_weather + lucky_day
+- 可以为每个目的地查询完整信息
+- 3个或更多目的地：每个目的地都可以详细查询
+
+输出JSON格式（**必须是纯JSON，不要markdown代码块**）：
+{{
+  "travel_segments": [
+    {{
+      "origin": "出发城市",
+      "destination": "目的地城市",
+      "days": 天数,
+      "date_start": "YYYY-MM-DD"
+    }}
+  ],
+  "budget_allocation": {{
+    "城市名": 预算金额
+  }},
+  "query_plan": [
+    {{
+      "segment": 段索引(0-based),
+      "tool": "工具名",
+      "params": {{
+        "参数名": "参数值"
+      }},
+      "description": "这一步的目的"
+    }}
+  ],
+  "initial_suggestions": [
+    "初步建议1",
+    "初步建议2"
+  ]
+}}
+
+可用工具：
+- rag_search: 查询景点攻略，参数 {{"query": "城市 景点"}}
+- train_query: 查询火车票，参数 {{"origin": "出发地", "destination": "目的地", "date": "YYYY-MM-DD"}}
+- gaode_driving: 查询自驾路线，参数 {{"origin": "起点坐标", "destination": "终点坐标"}} （需先用gaode_geo查询坐标）
+- flight_query: 查询航班，参数 {{"dep": "城市名", "arr": "城市名", "date": "YYYY-MM-DD"}} （支持中文城市名，会自动转换为机场代码）
+- lucky_day: 查询黄历吉日，参数 {{"date": "YYYY-MM-DD"}}
+- gaode_weather: 查询天气，参数 {{"city": "城市名"}}
+- gaode_hotel_search: 查询酒店，参数 {{"keywords": "城市 酒店", "city": "城市名"}}
+
+示例1（单目的地复杂场景）：如果用户问\"月12月12日从上海到南京3天，2个老人1个孩子，预算1500元\"（预算紧张+特殊需求），应该分解为：
+
+**travel_segments**:
+[
+  {{"origin": "上海", "destination": "南京", "days": 3, "date_start": "2025-12-12"}}
+]
+
+**query_plan** （无步骤限制，可以包含所有必要信息）:
+[
+  {{"segment": 0, "tool": "rag_search", "params": {{"query": "南京 景点 老人 儿童"}}, "description": "查询南京适合老人儿童的景点"}},
+  {{"segment": 0, "tool": "train_query", "params": {{"origin": "上海", "destination": "南京", "date": "2025-12-12"}}, "description": "查询上海到南京高铁"}},
+  {{"segment": 0, "tool": "gaode_hotel_search", "params": {{"keywords": "南京 经济型 酒店", "city": "南京"}}, "description": "查询南京经济型酒店"}},
+  {{"segment": 0, "tool": "gaode_weather", "params": {{"city": "南京"}}, "description": "查询南京天气，提醒老人儿童添衣"}},
+  {{"segment": 0, "tool": "lucky_day", "params": {{"date": "2025-12-12"}}, "description": "查询出行吉日"}},
+  {{"segment": -1, "tool": "train_query", "params": {{"origin": "南京", "destination": "上海", "date": "2025-12-15"}}, "description": "查询返程交通"}}
+]
+
+✅ **无限制**：单目的地场景可以包含所有工具，没有步骤限制！
+
+示例2（多目的地，7步精简版）：如果用户问\"上海到青岛3天再去大连2天，出发12月12日，预算3000元\"，应该分解为：
+
+**travel_segments**:
+[
+  {{"origin": "上海", "destination": "青岛", "days": 3, "date_start": "2025-12-12"}},
+  {{"origin": "青岛", "destination": "大连", "days": 2, "date_start": "2025-12-15"}}
+]
+
+**query_plan** （无步骤限制，每个目的地都可以查询完整信息）:
+[
+  {{"segment": 0, "tool": "rag_search", "params": {{"query": "青岛 景点"}}, "description": "查询青岛景点攻略"}},
+  {{"segment": 0, "tool": "train_query", "params": {{"origin": "上海", "destination": "青岛", "date": "2025-12-12"}}, "description": "查询上海到青岛交通"}},
+  {{"segment": 0, "tool": "gaode_hotel_search", "params": {{"keywords": "青岛 酒店", "city": "青岛"}}, "description": "查询青岛酒店"}},
+  {{"segment": 1, "tool": "rag_search", "params": {{"query": "大连 景点"}}, "description": "查询大连景点攻略"}},
+  {{"segment": 1, "tool": "train_query", "params": {{"origin": "青岛", "destination": "大连", "date": "2025-12-15"}}, "description": "查询青岛到大连交通"}},
+  {{"segment": 1, "tool": "gaode_hotel_search", "params": {{"keywords": "大连 酒店", "city": "大连"}}, "description": "查询大连酒店"}},
+  {{"segment": -1, "tool": "train_query", "params": {{"origin": "大连", "destination": "上海", "date": "2025-12-17"}}, "description": "查询返程交通"}}
+]
+
+✅ **无限制**：多目的地场景也可以为每个目的地查询天气和黄历，所有目的地都可以详细查询！
+
+⚠️ **关键**：train_query/flight_query 的 params 必须包含 origin/destination/date，不能省略！
+
+示例3（单目的地简单场景）：如果用户问\"我12月12日从上海到杭州2天，预算2000元\"（无特殊需求），这是往返行程，只有1个目的地：
+- 第1段：上海→杭州，2天
+- 不要单独拆“杭州→上海”，回程只在交通工具查询中体现，不构成新的行程段。
+- 简单场景可以省略天气和黄历，关注核心信息：RAG + 交通 + 酒店 + 返程。
+
+✨ **系统优势**：
+系统已迁移到 LangChain Agent，彻底解决了递归限制问题！
+
+✅ **无步骤限制**：query_plan 可以包含任意数量的步骤（10步、20步、甚至更多）
+✅ **灵活规划**：可以为每个目的地查询完整信息
+✅ **多种工具**：可以同时查询多种交通方式进行对比
+✅ **完整信息**：不再需要省略天气、黄历等信息
+
+请放心规划完整的查询流程！
+    """
+    
+    context = {
+        "user_query": user_query,
+        "destination": destination,
+        "origin": origin,
+        "travel_days": travel_days,
+        "budget": budget,
+        "travel_date": travel_date,
+        "scenario_type": scenario_type
+    }
+    
+    try:
+        r1 = get_r1_instance()
+        print(f"  💭 R1开始深度分析...")
+        result = await r1.analyze(problem, context)
+        
+        print(f"  ✅ R1分析完成，解析结果...")
+        
+        # 解析R1输出
+        r1_plan = None
+        try:
+            # 尝试解析JSON
+            if isinstance(result, str):
+                # 移除可能的markdown代码块
+                result_clean = result.strip()
+                if result_clean.startswith('```'):
+                    # 移除```json和```
+                    lines = result_clean.split('\n')
+                    result_clean = '\n'.join(lines[1:-1]) if len(lines) > 2 else result_clean
+                r1_plan = json.loads(result_clean)
+            else:
+                r1_plan = result
+            
+            print(f"  ✅ JSON解析成功")
+            print(f"    行程段数: {len(r1_plan.get('travel_segments', []))}")
+            print(f"    查询计划步骤: {len(r1_plan.get('query_plan', []))}")
+            
+            # 显示行程段
+            for i, segment in enumerate(r1_plan.get('travel_segments', [])):
+                print(f"    段{i+1}: {segment.get('origin')} → {segment.get('destination')}, {segment.get('days')}天")
+            
+            # 无步骤限制！不再需要截断
+            query_plan = r1_plan.get('query_plan', [])
+            print(f"    query_plan 步数: {len(query_plan)} ✅ 无限制！")
+            
+        except json.JSONDecodeError as e:
+            print(f"  ⚠️ JSON解析失败: {e}")
+            print(f"    R1返回原始文本: {result[:200]}...")
+            # 如果JSON解析失败，创建一个简单的回退计划
+            r1_plan = {
+                "travel_segments": [],
+                "budget_allocation": {},
+                "query_plan": [],
+                "initial_suggestions": []
+            }
+        print(f"{'='*60}\n")
+        
+        # 保持原始全局字段不变，仅更新R1相关数据
+        update_dict = {
+            'r1_plan': r1_plan,
+            'travel_segments': r1_plan.get('travel_segments', []),
+            'scenario_type': scenario_type,
+            'messages': [status_msg]
+        }
+        
+        # 显示行程段信息（调试用）
+        segments = r1_plan.get('travel_segments', [])
+        if segments:
+            print(f"  ✅ R1生成 {len(segments)} 个行程段：")
+            for i, seg in enumerate(segments):
+                print(f"     段{i+1}: {seg.get('origin')} → {seg.get('destination')}, {seg.get('days')}天, 出发{seg.get('date_start')}")
+        
+        return update_dict
+        
+    except Exception as e:
+        print(f"❌ R1 Strategy分析异常: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # 回退方案：返回空计划，让系统继续使用Qwen3主导
+        return {
+            'r1_plan': None,
+            'travel_segments': [],
+            'scenario_type': scenario_type,
+            'messages': [AIMessage(content=f"⚠️ R1分析遇到问题，将使用标准流程处理: {str(e)}")]
+        }
+
+
+async def r1_optimization_node(state: TravelPlanState) -> Dict[str, Any]:
+    """
+R1优化节点 - 基于收集的数据优化多段方案
+    
+    这是R1的第二次介入，负责：
+    1. 综合分析所有收集的数据（多段rag、交通、天气等）
+    2. 对比不同段的性价比
+    3. 优化预算分配和时间安排
+    4. 生成多套方案对比
+    5. 识别风险并提出建议
+    """
+    from travel_agent.tools.r1_tool import get_r1_instance
+    
+    print(f"\n{'='*60}")
+    print("▶️ R1 Optimization 节点开始执行")
+    
+    status_msg = AIMessage(content="📊 正在综合分析行程数据，优化方案…")
+    
+    r1_plan = state.get('r1_plan', {})
+    travel_segments = state.get('travel_segments', [])
+    budget = state.get('budget', 0)
+    
+    if not travel_segments:
+        print("  ⚠️ 没有多段行程，跳过R1优化")
+        return {'messages': [status_msg]}
+    
+    print(f"  行程段数: {len(travel_segments)}")
+    
+    # 收集所有段的数据
+    segment_data = []
+    for i, segment in enumerate(travel_segments):
+        seg_info = {
+            'segment_index': i,
+            'route': f"{segment.get('origin')} → {segment.get('destination')}",
+            'destination': segment.get('destination'),
+            'days': segment.get('days'),
+            'date_start': segment.get('date_start', ''),
+        }
+        
+        # 添加该段的查询结果
+        # 从 rag_results_history 中提取对应段的结果
+        rag_history = state.get('rag_results_history', [])
+        if i < len(rag_history):
+            seg_info['rag_results'] = rag_history[i][:500] if rag_history[i] else '未查询'
+        
+        # 从 segment_train_info 中提取
+        segment_train = state.get('segment_train_info', {})
+        if i in segment_train:
+            train_data = segment_train[i]
+            if isinstance(train_data, dict):
+                seg_info['train_info'] = f"已查询，票价约{train_data.get('price', 'N/A')}元"
+            else:
+                seg_info['train_info'] = '已查询'
+        else:
+            # 回退：从全局train_info查找
+            seg_info['train_info'] = '未查询'
+        
+        segment_data.append(seg_info)
+        print(f"    段{i+1}: {seg_info['route']}, {seg_info['days']}天")
+    
+    # 构建R1 prompt
+    problem = f"""
+用户的多段旅行计划已经执行完成，现在需要你进行深度优化和分析。
+
+R1初步规划：
+{json.dumps(r1_plan.get('initial_suggestions', []), ensure_ascii=False, indent=2)}
+
+预算分配：
+{json.dumps(r1_plan.get('budget_allocation', {}), ensure_ascii=False, indent=2)}
+
+实际收集的数据：
+{json.dumps(segment_data, ensure_ascii=False, indent=2)}
+
+总预算：{budget}元
+全局信息：
+- 天气: {str(state.get('weather_info', {}))[: 200]}
+- 黄历: {str(state.get('lucky_day_info', ''))[: 200]}
+
+你的任务：
+1. **预算分析**：
+   - 每段的预算分配是否合理？
+   - 是否需要调整？（如果某段景点少、物价低，可以减少预算）
+   - 给出优化后的预算分配建议
+
+2. **时间安排分析**：
+   - 每段的天数安排是否合理？
+   - 是否过于紧凑或松散？
+   - 是否需要调整？
+
+3. **性价比对比**：
+   - 每段的性价比如何？
+   - 哪一段更值得多花时间？
+
+4. **风险评估**：
+   - 天气风险（雨天、高温、低温）
+   - 时间风险（连接紧张、休息不足）
+   - 预算风险（超支可能性）
+
+5. **方案对比**：
+   - 生成 2-3 套可选方案：
+     * 经济型：最小化成本
+     * 均衡型：当前方案（可微调）
+     * 舒适型：提升体验（可增加预算）
+
+输出JSON格式（**纯JSON，不markdown**）：
+{{
+  "budget_analysis": {{
+    "original": {{}},
+    "optimized": {{}},
+    "adjustment_reason": ""
+  }},
+  "time_analysis": {{
+    "issues": [],
+    "suggestions": []
+  }},
+  "value_comparison": [
+    {{
+      "segment": 0,
+      "destination": "",
+      "value_score": "9/10",
+      "highlights": ["亮点1", "亮点2"],
+      "concerns": ["问题1"]
+    }}
+  ],
+  "risk_warnings": [
+    "风险1",
+    "风险2"
+  ],
+  "alternative_plans": [
+    {{
+      "name": "经济方案",
+      "description": "",
+      "total_cost": 0,
+      "pros": [],
+      "cons": []
+    }}
+  ],
+  "final_recommendation": ""
+}}
+    """
+    
+    context = {
+        "r1_plan": r1_plan,
+        "travel_segments": travel_segments,
+        "segment_data": segment_data,
+        "budget": budget
+    }
+    
+    try:
+        r1 = get_r1_instance()
+        print(f"  💭 R1开始优化分析...")
+        result = await r1.analyze(problem, context)
+        
+        print(f"  ✅ R1优化完成，解析结果...")
+        
+        # 解析R1输出
+        optimization = None
+        try:
+            if isinstance(result, str):
+                result_clean = result.strip()
+                if result_clean.startswith('```'):
+                    lines = result_clean.split('\n')
+                    result_clean = '\n'.join(lines[1:-1]) if len(lines) > 2 else result_clean
+                optimization = json.loads(result_clean)
+            else:
+                optimization = result
+            
+            print(f"  ✅ JSON解析成功")
+            print(f"    风险警告数: {len(optimization.get('risk_warnings', []))}")
+            print(f"    替代方案数: {len(optimization.get('alternative_plans', []))}")
+            
+        except json.JSONDecodeError as e:
+            print(f"  ⚠️ JSON解析失败: {e}")
+            print(f"    R1返回原始文本: {result[:200]}...")
+            # 使用原始文本作为回退
+            optimization = {
+                "raw_analysis": result,
+                "risk_warnings": [],
+                "alternative_plans": []
+            }
+        
+        print(f"{'='*60}\n")
+        
+        return {
+            'reasoning_chain': result,  # 保留原始推理链
+            'optimization_suggestions': optimization.get('budget_analysis', {}),
+            'alternative_plans': optimization.get('alternative_plans', []),
+            'risk_warnings': optimization.get('risk_warnings', []),
+            'value_comparison': optimization.get('value_comparison', []),
+            'messages': [status_msg]
+        }
+        
+    except Exception as e:
+        print(f"❌ R1 Optimization异常: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return {
+            'reasoning_chain': f"R1优化失败: {str(e)}",
+            'optimization_suggestions': {},
+            'alternative_plans': [],
+            'messages': [AIMessage(content=f"⚠️ R1优化遇到问题: {str(e)}")]
+        }
+
+
 async def deep_analysis_node(state: TravelPlanState) -> Dict[str, Any]:
     """深度分析节点"""
     from travel_agent.tools.r1_tool import get_r1_instance
@@ -1156,15 +2029,34 @@ async def synthesizer_node(state: TravelPlanState) -> Dict[str, Any]:
     budget = state.get("budget", 0)
     travel_date = state.get("travel_date", "")
     preferences = state.get("preferences", [])
+    travel_segments = state.get("travel_segments", [])
     
     # 构建完整的用户需求描述
-    user_query_parts = []
-    if origin:
-        user_query_parts.append(f"从{origin}")
-    if destination:
-        user_query_parts.append(f"去{destination}旅游")
-    if travel_days:
-        user_query_parts.append(f"{travel_days}天")
+    # 检测是否为多段行程
+    if travel_segments and len(travel_segments) > 1:
+        # 多段行程：构建完整路线描述
+        route_parts = [travel_segments[0].get('origin', origin)]
+        for seg in travel_segments:
+            route_parts.append(seg.get('destination', ''))
+        route_str = " → ".join(filter(None, route_parts))
+        
+        user_query_parts = [f"从{route_str}旅游"]
+        
+        # 计算总天数
+        total_days = sum(seg.get('days', 0) for seg in travel_segments)
+        if total_days:
+            user_query_parts.append(f"共{total_days}天")
+    else:
+        # 单段或无段：使用原逻辑
+        user_query_parts = []
+        if origin:
+            user_query_parts.append(f"从{origin}")
+        if destination:
+            user_query_parts.append(f"去{destination}旅游")
+        if travel_days:
+            user_query_parts.append(f"{travel_days}天")
+    
+    # 添加通用信息
     if budget:
         user_query_parts.append(f"预算{budget}元")
     if travel_date:
@@ -1182,38 +2074,149 @@ async def synthesizer_node(state: TravelPlanState) -> Dict[str, Any]:
     query_mode = state.get("query_mode", "full")
     print(f"  查询模式: {query_mode}")
     
+    # 支持累积历史（ReAct 模式）和单次结果（旧模式）
+    rag_results_history = state.get("rag_results_history", [])
+    if rag_results_history:
+        # ReAct 模式：使用累积的多次检索结果
+        rag_results = "\n\n---\n\n".join(rag_results_history)
+        print(f"  使用 ReAct 累积的 RAG 结果: {len(rag_results_history)} 次检索")
+    else:
+        # 旧模式：向后兼容
+        rag_results = state.get("rag_results", "")
+        print(f"  使用单次 RAG 结果（旧模式）")
+    
     if query_mode == "simple":
         # 简单查询模式：只显示景点信息
         prompt = SIMPLE_QUERY_PROMPT_TEMPLATE.format(
             destination=destination,
-            rag_results=state.get("rag_results", "未找到相关信息")
+            rag_results=rag_results or "未找到相关信息"
         )
     else:
         # 完整规划模式：显示完整旅行方案
-        # 提取 train_info 的完整文本
+        # 提取 train_info 的完整文本，并增强错误处理
         train_info_raw = state.get("train_info", {})
         if isinstance(train_info_raw, dict):
             if "tickets_text" in train_info_raw:
                 train_info_text = train_info_raw["tickets_text"]
             elif "error" in train_info_raw:
-                train_info_text = f"错误: {train_info_raw['error']}"
+                # 提取详细错误信息
+                error_msg = train_info_raw['error']
+                reason = train_info_raw.get('reason', '')
+                suggestion = train_info_raw.get('suggestion', '请使用12306官网或APP查询')
+                train_info_text = f"❌ 工具调用失败：{error_msg}"
+                if reason:
+                    train_info_text += f"\n原因：{reason}"
+                if suggestion:
+                    train_info_text += f"\n建议：{suggestion}"
             else:
                 train_info_text = str(train_info_raw)
         else:
             train_info_text = str(train_info_raw)
         
+        # 提取 driving_info 的完整文本，并增强错误处理
+        driving_info_raw = state.get("driving_info")
+        if driving_info_raw is None:
+            driving_info_text = "❌ 未查询到自驾路线（可能距离过远或输入异常）"
+        elif isinstance(driving_info_raw, dict):
+            if "error" in driving_info_raw:
+                # 提取详细错误信息
+                error_msg = driving_info_raw.get('error', '查询失败')
+                suggestion = driving_info_raw.get('suggestion', '')
+                driving_info_text = f"❌ {error_msg}"
+                if suggestion:
+                    driving_info_text += f"\n建议：{suggestion}"
+            elif "data" in driving_info_raw:
+                # 成功查询，提取数据
+                data = driving_info_raw["data"]
+                distance_km = driving_info_raw.get("distance_km", 0)
+                warning = driving_info_raw.get("warning", "")
+                driving_info_text = str(data)
+                if warning:
+                    driving_info_text = f"⚠️ {warning}\n\n{driving_info_text}"
+            else:
+                driving_info_text = str(driving_info_raw)
+        else:
+            driving_info_text = str(driving_info_raw)
+        
+        # 提取 flight_info 的完整文本
+        flight_info_raw = state.get("flight_info")
+        if flight_info_raw:
+            flight_info_text = str(flight_info_raw)
+        else:
+            flight_info_text = "未查询航班信息（通常用于远距离出行 >800km）"
+        
         print(f"  train_info 长度: {len(train_info_text)} 字符")
         print(f"  train_info 前300字符: {train_info_text[:300]}")
+        print(f"  driving_info 长度: {len(driving_info_text)} 字符")
+        print(f"  driving_info 前300字符: {driving_info_text[:300]}")
+        print(f"  flight_info 长度: {len(flight_info_text)} 字符")
+        print(f"  flight_info 前300字符: {flight_info_text[:300]}")
         
         prompt = SYNTHESIZER_PROMPT_TEMPLATE.format(
             user_query=user_query,
-            rag_results=state.get("rag_results", ""),
+            rag_results=rag_results or "",  # 使用上面处理后的 rag_results
             hotel_info=state.get("hotel_info", "未查询到酒店信息"),
             train_info=train_info_text,
-            driving_info=state.get("driving_info", "未查询到自驾路线（可能距离过远）"),
+            driving_info=driving_info_text,
+            flight_info=flight_info_text,
             lucky_day_info=state.get("lucky_day_info", ""),
             weather_info=state.get("weather_info", {})
         )
+    
+    # ==== 添加R1分析结果展示 ====
+    r1_plan = state.get('r1_plan')
+    travel_segments = state.get('travel_segments', [])
+    risk_warnings = state.get('risk_warnings', [])
+    alternative_plans = state.get('alternative_plans', [])
+    value_comparison = state.get('value_comparison', [])
+    
+    if r1_plan or travel_segments:
+        print(f"  🧠 检测到R1分析结果，添加到prompt")
+        
+        r1_section = "\n\n"
+        r1_section += "="*50 + "\n"
+        r1_section += "🧐 **智能规划分析**\n"
+        r1_section += "="*50 + "\n\n"
+        
+        # 1. 行程分解
+        if travel_segments:
+            r1_section += "🗺️ **多段行程规划**\n\n"
+            r1_section += format_travel_segments(travel_segments)
+            r1_section += "\n\n"
+        
+        # 2. 预算分配
+        if r1_plan and 'budget_allocation' in r1_plan:
+            budget_alloc = r1_plan.get('budget_allocation', {})
+            if budget_alloc:
+                r1_section += "💰 **预算分配建议**\n\n"
+                r1_section += format_budget_allocation(budget_alloc)
+                r1_section += "\n\n"
+        
+        # 3. 性价比对比
+        if value_comparison:
+            r1_section += "🎯 **性价比分析**\n"
+            r1_section += format_value_comparison(value_comparison)
+            r1_section += "\n\n"
+        
+        # 4. 风险警告
+        if risk_warnings:
+            r1_section += "⚠️ **风险提示**\n\n"
+            r1_section += format_risk_warnings(risk_warnings)
+            r1_section += "\n\n"
+        
+        # 5. 替代方案
+        if alternative_plans:
+            r1_section += "🔄 **可选方案对比**\n"
+            r1_section += format_alternative_plans(alternative_plans)
+            r1_section += "\n\n"
+        
+        # 6. 添加提示
+        r1_section += "-" * 50 + "\n"
+        r1_section += "📚 *以上分析由智能系统综合评估生成，为您的旅行决策提供参考*\n"
+        r1_section += "=" * 50 + "\n\n"
+        
+        # 将R1分析添加到prompt之前
+        prompt = r1_section + prompt
     
     response = await qwen3_llm.ainvoke([HumanMessage(content=prompt)])
     
@@ -1222,3 +2225,875 @@ async def synthesizer_node(state: TravelPlanState) -> Dict[str, Any]:
         "travel_plan": response.content,
         "messages": [AIMessage(content=response.content)],
     }
+
+
+# ========== ReAct Agentic RAG Nodes ==========
+
+async def thought_node(state: TravelPlanState) -> Dict[str, Any]:
+    """
+    ReAct 思考节点 - 分析当前状态，决定下一步行动
+    这是 ReAct 循环的大脑，负责：
+    1. 分析已收集的信息
+    2. 识别信息缺口
+    3. 决定下一步使用哪个工具
+    
+    **双模型协同**：
+    - 如果有R1计划：按照R1的query_plan执行（R1主导）
+    - 如果没有R1计划：Qwen3自主决策（Qwen3主导）
+    """
+    from travel_agent.tools.tool_registry import get_tools_description_for_llm
+    
+    print(f"\n{'='*60}")
+    print("🧠 [THOUGHT NODE] 开始思考...")
+    print(f"{'='*60}")
+    
+    iteration_count = state.get("iteration_count", 0) or 0
+    max_iterations = state.get("max_iterations", 8) or 8
+    r1_plan = state.get("r1_plan")
+    
+    print(f"当前迭代: {iteration_count}/{max_iterations}")
+    print(f"R1计划状态: {'R1主导' if r1_plan else 'Qwen3主导'}")
+    
+    # 安全检查：如果迭代次数已达到最大值，强制结束
+    if iteration_count >= max_iterations:
+        print(f"  ⚠️ 达到最大迭代次数 {max_iterations}，强制结束循环")
+        return {
+            "current_thought": f"达到最大迭代次数 ({max_iterations})，结束循环",
+            "thought_history": [f"达到max_iterations"],
+            "current_action": {"tool": "final_answer", "params": {}},
+            "should_continue": False,
+            "is_complete": True,
+            "iteration_count": iteration_count + 1,
+        }
+    
+    # ==== R1主导模式：按照R1的计划执行 ====
+    if r1_plan and 'query_plan' in r1_plan:
+        query_plan = r1_plan.get('query_plan', [])
+        
+        # 打印完整的 query_plan 内容（用于调试）
+        if iteration_count == 0:
+            print(f"\n📝 R1生成的完整 query_plan ({len(query_plan)}步):")
+            for i, step in enumerate(query_plan):
+                print(f"  [{i}] segment={step.get('segment')}, tool={step.get('tool')}, params={step.get('params')}")
+            print(f"{'='*60}\n")
+        
+        # 强制检查：如果已经完成所有步骤，直接返回 final_answer
+        # 注意：iteration_count 在这里是已经+1后的值，所以需要比较 >= len(query_plan)
+        if iteration_count >= len(query_plan):
+            print(f"\n✅ R1计划已全部执行完毕（iteration={iteration_count}, plan_length={len(query_plan)}）")
+            print(f"  强制返回 final_answer，准备进入Synthesizer")
+            print(f"{'='*60}\n")
+            return {
+                "current_thought": "R1计划已全部执行完毕，信息充分",
+                "thought_history": ["R1计划完成"],
+                "current_action": {
+                    "tool": "final_answer",
+                    "params": {}
+                },
+                "should_continue": False,
+                "is_complete": True,
+                "iteration_count": iteration_count,  # 保持当前值
+            }
+        
+        if iteration_count < len(query_plan):
+            # 执行R1计划中的下一步
+            next_step = query_plan[iteration_count]
+            tool_name = next_step.get('tool', '')
+            params = next_step.get('params', {})
+            description = next_step.get('description', '')
+            segment = next_step.get('segment', 0)
+            
+            # 检查是否是最后一步
+            # iteration_count 是从0开始，所以最后一步的索引 = len(query_plan) - 1
+            is_last_step = iteration_count == (len(query_plan) - 1)
+            
+            print(f"\n🎯 [按R1计划执行] 第{iteration_count + 1}步，共{len(query_plan)}步")
+            if is_last_step:
+                print(f"  ✅ 这是最后一步，执行后将结束")
+            print(f"  段索引: {segment}")
+            print(f"  工具: {tool_name}")
+            print(f"  参数: {params}")
+            print(f"  目的: {description}")
+            print(f"{'='*60}\n")
+            
+            return {
+                "current_thought": f"R1计划第{iteration_count+1}步：{description}",
+                "thought_history": [f"R1计划第{iteration_count+1}步：{description}"],
+                "current_action": {
+                    "tool": tool_name,
+                    "params": params,
+                    "segment": segment,  # 保留段信息供action_node使用
+                    "is_last_step": is_last_step  # 标记是否是最后一步
+                },
+                "should_continue": not is_last_step,  # 如果是最后一步，下次就不继续了
+                "is_complete": is_last_step,  # 如果是最后一步，标记完成
+                "iteration_count": iteration_count + 1,
+            }
+        else:
+            # R1计划执行完毕
+            print(f"\n✅ R1计划已全部执行完毕（{len(query_plan)}步）")
+            
+            # === 禁用补充查询：为了递归限制，不再追加 lucky_day 查询 ===
+            # 递归计算：补充查询会增加 3 步 (thought + action + observation)
+            # 单目的地 + 补充: 3 + 6×3 + 3(补充) + 1(r1_opt) + 1(synth) = 26 > 25 ❌
+            # 因此必须禁用补充查询，R1 必须在 query_plan 中直接包含所有必要查询
+            
+            lucky_missing = not state.get("lucky_day_info")
+            if lucky_missing:
+                print(f"  ℹ️ 检测到缺少黄历信息，但为了递归限制，不进行补充查询")
+            
+            print(f"  准备进入Synthesizer生成最终方案")
+            print(f"{'='*60}\n")
+            
+            return {
+                "current_thought": "R1计划已全部执行完毕，信息充分",
+                "thought_history": ["R1计划完成"],
+                "current_action": {
+                    "tool": "final_answer",
+                    "params": {}
+                },
+                "should_continue": False,
+                "is_complete": True,
+                "iteration_count": iteration_count + 1,
+            }
+    
+    # ==== Qwen3主导模式：自主决策 ====
+    print(f"\n🤖 [Qwen3自主决策模式]")
+    
+    # 构建已收集信息的摘要
+    collected_info = []
+    
+    # RAG 检索结果
+    if state.get("rag_results"):
+        rag_summary = state.get("rag_results", "")[:500]  # 只显示前500字符
+        collected_info.append(f"• RAG检索: 已获取{len(state.get('rag_results',''))} 字符的景点信息")
+    
+    # 火车票信息
+    if state.get("train_info"):
+        collected_info.append("• 火车票: 已查询")
+    
+    # 自驾路线
+    if state.get("driving_info"):
+        collected_info.append("• 自驾路线: 已查询")
+    
+    # 酒店信息
+    if state.get("hotel_info"):
+        collected_info.append("• 酒店信息: 已获取")
+    
+    # 天气信息
+    if state.get("weather_info"):
+        collected_info.append("• 天气预报: 已查询")
+    
+    # 黄历信息
+    if state.get("lucky_day_info"):
+        collected_info.append("• 黄历吉日: 已查询")
+    
+    # 航班信息
+    if state.get("flight_info"):
+        collected_info.append("• 航班信息: 已查询")
+    
+    collected_info_str = "\n".join(collected_info) if collected_info else "⚠️ 暂无信息"
+    
+    print(f"已收集的信息:\n{collected_info_str}")
+    
+    # 获取可用工具描述
+    tools_desc = get_tools_description_for_llm()
+    
+    # 构造用户查询
+    user_query_parts = []
+    if state.get("destination"):
+        user_query_parts.append(f"目的地:{state['destination']}")
+    if state.get("origin"):
+        user_query_parts.append(f"出发地:{state['origin']}")
+    if state.get("travel_days"):
+        user_query_parts.append(f"{state['travel_days']}天")
+    if state.get("budget"):
+        user_query_parts.append(f"预算{state['budget']}元")
+    
+    user_query = ", ".join(user_query_parts) if user_query_parts else "未知需求"
+    
+    # 使用 REACT_THOUGHT_PROMPT
+    prompt = REACT_THOUGHT_PROMPT.format(
+        user_query=user_query,
+        destination=state.get("destination", "未知"),
+        origin=state.get("origin", "未知"),
+        travel_days=state.get("travel_days", 0),
+        budget=state.get("budget", 0),
+        travel_date=state.get("travel_date", "未知"),
+        preferences=state.get("preferences", []),
+        collected_info=collected_info_str,
+        iteration_count=iteration_count,
+        max_iterations=max_iterations,
+        available_tools=tools_desc
+    )
+    
+    try:
+        response = await qwen3_llm.ainvoke([HumanMessage(content=prompt)])
+        content = response.content.strip()
+        
+        # 解析 JSON
+        if "```json" in content:
+            start = content.find("```json") + 7
+            end = content.find("```", start)
+            if end != -1:
+                content = content[start:end].strip()
+        elif "```" in content:
+            start = content.find("```") + 3
+            end = content.find("```", start)
+            if end != -1:
+                content = content[start:end].strip()
+        
+        # 提取第一个 JSON 对象
+        if content.startswith("{"):
+            brace_count = 0
+            for i, char in enumerate(content):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        content = content[:i+1]
+                        break
+        
+        decision = json.loads(content)
+        
+        thought = decision.get("thought", "")
+        action = decision.get("action", "")
+        action_input = decision.get("action_input", {})
+        continue_flag = decision.get("continue", True)
+        
+        print(f"\n💡 思考: {thought}")
+        print(f"🎯 决定行动: {action}")
+        print(f"📝 行动参数: {action_input}")
+        print(f"➡️  继续循环: {continue_flag}")
+        print(f"{'='*60}\n")
+        
+        return {
+            "current_thought": thought,
+            "thought_history": [thought],
+            "current_action": {
+                "tool": action,
+                "params": action_input
+            },
+            "should_continue": continue_flag,
+            "iteration_count": iteration_count + 1,
+        }
+        
+    except Exception as e:
+        print(f"❌ 思考节点异常: {e}")
+        print(f"原始响应: {response.content if 'response' in locals() else 'N/A'}")
+        import traceback
+        traceback.print_exc()
+        
+        # 失败时的默认行为：结束循环
+        return {
+            "current_thought": f"思考失败: {str(e)}",
+            "thought_history": [f"思考失败: {str(e)}"],
+            "current_action": {
+                "tool": "final_answer",
+                "params": {}
+            },
+            "should_continue": False,
+            "is_complete": True,
+            "iteration_count": iteration_count + 1,
+        }
+
+
+async def action_node(state: TravelPlanState) -> Dict[str, Any]:
+    """
+    ReAct 行动节点 - 执行工具调用
+    根据 thought_node 的决策，调用相应的工具
+    """
+    print(f"\n{'='*60}")
+    print("⚙️ [ACTION NODE] 执行行动...")
+    print(f"{'='*60}")
+    
+    current_action = state.get("current_action", {})
+    if not current_action:
+        print("⚠️ 没有行动指令，跳过")
+        return {"current_observation": "没有行动"}
+    
+    tool_name = current_action.get("tool", "")
+    params = current_action.get("params", {})
+    
+    print(f"🔧 工具: {tool_name}")
+    print(f"📝 参数: {params}")
+    
+    # 特殊工具：final_answer
+    if tool_name == "final_answer":
+        print("✅ 信息已充分，准备生成最终答案")
+        return {
+            "current_observation": "信息充分，准备生成答案",
+            "is_complete": True,
+            "should_continue": False,
+        }
+    
+    # 调用对应的工具
+    observation = ""
+    
+    try:
+        # 根据工具名称路由到相应的函数
+        if tool_name == "rag_search":
+            # 调用 RAG 检索
+            from travel_agent.tools.rag_tool import get_rag_instance
+            rag = get_rag_instance()
+            query = params.get("query", "")
+            k = params.get("k", 3)
+            result = await rag.search(query, k=k)
+            observation = f"RAG检索结果: {result}"
+            
+            # 更新 state
+            return {
+                "rag_results": result,
+                "current_observation": observation,
+                "action_history": [current_action],
+            }
+        
+        elif tool_name == "train_query":
+            # 调用完整的 train_query_node，包含站点代码查询、自驾路线等逻辑
+            print(f"  调用完整的 train_query_node...")
+            
+            # 检查参数来源
+            origin_from_params = params.get("origin")
+            dest_from_params = params.get("destination")
+            date_from_params = params.get("date")
+            
+            origin_from_state = state.get("origin", "")
+            dest_from_state = state.get("destination", "")
+            date_from_state = state.get("travel_date", "")
+            
+            # 如果 params 不完整，尝试根据 segment 回填
+            seg_idx = state.get("current_action", {}).get("segment")
+            if (not origin_from_params or not dest_from_params or not date_from_params) and seg_idx is not None:
+                segs = state.get("travel_segments", []) or []
+                if 0 <= seg_idx < len(segs):
+                    seg = segs[seg_idx]
+                    origin_from_params = origin_from_params or seg.get("origin")
+                    dest_from_params = dest_from_params or seg.get("destination")
+                    date_from_params = date_from_params or seg.get("date_start")
+                    print(f"  🔄 基于segment[{seg_idx}]回填参数: origin={origin_from_params}, dest={dest_from_params}, date={date_from_params}")
+            
+            print(f"  📝 参数来源调试:")
+            print(f"    params中: origin={params.get('origin')}, dest={params.get('destination')}, date={params.get('date')}")
+            print(f"    state中: origin={origin_from_state}, dest={dest_from_state}, date={date_from_state}")
+            
+            # 构造临时 state，包含必要的字段（优先使用回填后的params）
+            temp_state = {
+                "origin": origin_from_params or origin_from_state,
+                "destination": dest_from_params or dest_from_state,
+                "travel_date": date_from_params or date_from_state,
+            }
+            
+            print(f"    最终使用: origin={temp_state['origin']}, dest={temp_state['destination']}, date={temp_state['travel_date']}")
+            
+            # 调用完整的 train_query_node，添加超时保护
+            try:
+                import asyncio
+                # 设置90秒超时（12306返回数据可能很大）
+                result = await asyncio.wait_for(
+                    train_query_node(temp_state),
+                    timeout=90.0
+                )
+            except asyncio.TimeoutError:
+                print(f"  ⚠️ 12306查询超时90秒，返回部分结果")
+                result = {
+                    "train_info": {
+                        "error": "12306查询超时，可能是网络不稳定或返回数据过大",
+                        "origin": temp_state['origin'],
+                        "destination": temp_state['destination'],
+                        "date": temp_state['travel_date']
+                    },
+                    "driving_info": None
+                }
+            except Exception as e:
+                print(f"  ❌ 12306查询异常: {type(e).__name__}: {str(e)}")
+                result = {
+                    "train_info": {
+                        "error": f"12306查询失败: {str(e)}",
+                        "origin": temp_state['origin'],
+                        "destination": temp_state['destination'],
+                        "date": temp_state['travel_date']
+                    },
+                    "driving_info": None
+                }
+            
+            # 提取结果
+            train_info = result.get("train_info", {})
+            driving_info = result.get("driving_info")
+            
+            observation = f"火车票查询结果: {str(train_info)[:500]}"
+            if driving_info:
+                observation += f"\n自驾路线: {str(driving_info)[:200]}"
+            
+            return {
+                "train_info": train_info,
+                "driving_info": driving_info,
+                "current_observation": observation,
+                "action_history": [current_action],
+            }
+        
+        elif tool_name == "gaode_weather":
+            # 调用完整的 weather_query_node，包含多日预报和日期匹配
+            print(f"  调用完整的 weather_query_node...")
+            
+            # 检查参数来源
+            city_from_params = params.get("city")
+            dest_from_state = state.get("destination", "")
+            
+            # 如果缺参数，尝试基于 segment 回填
+            seg_idx = state.get("current_action", {}).get("segment")
+            if not city_from_params and seg_idx is not None:
+                segs = state.get("travel_segments", []) or []
+                if 0 <= seg_idx < len(segs):
+                    city_from_params = segs[seg_idx].get("destination")
+                    print(f"  🔄 基于segment[{seg_idx}]回填 city={city_from_params}")
+            
+            print(f"  📝 参数来源调试:")
+            print(f"    params中: city={params.get('city')}")
+            print(f"    state中: destination={dest_from_state}")
+            
+            # 构造临时 state
+            temp_state = {
+                "destination": city_from_params or dest_from_state,
+                "travel_days": state.get("travel_days", 1),
+                "travel_date": state.get("travel_date", ""),
+            }
+            
+            print(f"    最终使用: destination={temp_state['destination']}")
+            
+            # 调用完整的 weather_query_node
+            result = await weather_query_node(temp_state)
+            
+            # 提取结果
+            weather_info = result.get("weather_info", {})
+            
+            observation = f"天气查询结果: {str(weather_info)[:300]}"
+            
+            return {
+                "weather_info": weather_info,
+                "current_observation": observation,
+                "action_history": [current_action],
+            }
+        
+        elif tool_name == "gaode_hotel_search":
+            # 查询酒店
+            from travel_agent.tools.mcp_tools import get_mcp_manager
+            manager = await get_mcp_manager()
+            
+            print(f"  📝 参数来源调试:")
+            print(f"    params原始内容: {params}")
+            
+            # 如果缺少 city/keywords，尝试基于 segment 回填
+            seg_idx = state.get("current_action", {}).get("segment")
+            if seg_idx is not None and (not params.get("city") or not params.get("keywords")):
+                segs = state.get("travel_segments", []) or []
+                if 0 <= seg_idx < len(segs):
+                    city = params.get("city") or segs[seg_idx].get("destination")
+                    keywords = params.get("keywords") or f"{city} 酒店"
+                    params = {**params, "city": city, "keywords": keywords}
+                    print(f"  🔄 基于segment[{seg_idx}]回填: city={city}, keywords={keywords}")
+            
+            result = await manager.call_tool(
+                "Gaode Server",
+                "maps_text_search",
+                **params
+            )
+            observation = f"酒店搜索结果: {str(result)[:500]}"
+            
+            return {
+                "hotel_info": str(result),
+                "current_observation": observation,
+                "action_history": [current_action],
+            }
+        
+        elif tool_name == "lucky_day":
+            # 调用完整的 lucky_day_query_node，包含多种参数尝试和错误处理
+            print(f"  调用完整的 lucky_day_query_node...")
+            
+            # 检查参数来源
+            date_from_params = params.get("date")
+            date_from_state = state.get("travel_date", "")
+            
+            print(f"  📝 参数来源调试:")
+            print(f"    params中: date={date_from_params}")
+            print(f"    state中: travel_date={date_from_state}")
+            
+            # 构造临时 state
+            temp_state = {
+                "travel_date": params.get("date", state.get("travel_date", "")),
+            }
+            
+            print(f"    最终使用: travel_date={temp_state['travel_date']}")
+            
+            # 调用完整的 lucky_day_query_node
+            result = await lucky_day_query_node(temp_state)
+            
+            # 提取结果
+            lucky_day_info = result.get("lucky_day_info")
+            
+            if lucky_day_info:
+                observation = f"黄历查询结果: {str(lucky_day_info)[:300]}"
+            else:
+                observation = "黄历查询失败，可能是 bazi Server 连接问题或参数不匹配"
+            
+            return {
+                "lucky_day_info": lucky_day_info,
+                "current_observation": observation,
+                "action_history": [current_action],
+            }
+        
+        elif tool_name == "flight_query":
+            # 查询航班
+            from travel_agent.tools.mcp_tools import get_mcp_manager
+            manager = await get_mcp_manager()
+            
+            # 提取参数（支持两种格式）
+            print(f"  📝 参数来源调试:")
+            print(f"    params原始内容: {params}")
+            
+            dep = params.get("dep") or params.get("origin", "")
+            arr = params.get("arr") or params.get("destination", "")
+            date = params.get("date", "")
+            
+            # 如果参数缺失，基于 segment 回填
+            seg_idx = state.get("current_action", {}).get("segment")
+            if (not dep or not arr or not date) and seg_idx is not None:
+                segs = state.get("travel_segments", []) or []
+                if 0 <= seg_idx < len(segs):
+                    seg = segs[seg_idx]
+                    dep = dep or seg.get("origin", dep)
+                    arr = arr or seg.get("destination", arr)
+                    date = date or seg.get("date_start", date)
+                    print(f"  🔄 基于segment[{seg_idx}]回填: dep={dep}, arr={arr}, date={date}")
+            
+            print(f"    提取后: dep={dep}, arr={arr}, date={date}")
+            print(f"  航班查询: {dep} → {arr}, {date}")
+            
+            # ========== 城市名转机场三字码 ==========
+            # flight Server 要求 dep/arr 必须是 3 位机场代码（IATA代码）
+            city_to_airport = {
+                # 主要城市机场代码
+                "上海": "SHA",  # 上海浦东/虹桥
+                "北京": "PEK",  # 首都机场
+                "广州": "CAN",  # 白云机场
+                "深圳": "SZX",  # 宝安机场
+                "成都": "CTU",  # 双流机场
+                "杭州": "HGH",  # 萧山机场
+                "重庆": "CKG",  # 江北机场
+                "西安": "XIY",  # 咸阳机场
+                "武汉": "WUH",  # 天河机场
+                "南京": "NKG",  # 禄口机场
+                "青岛": "TAO",  # 流亭机场
+                "大连": "DLC",  # 周水子机场
+                "天津": "TSN",  # 滨海机场
+                "厅门": "XMN",  # 高崎机场
+                "福州": "FOC",  # 长乐机场
+                "昆明": "KMG",  # 长水机场
+                "湖南": "CSX",  # 黄花机场
+                "济南": "TNA",  # 遥墙机场
+                "郑州": "CGO",  # 新郑机场
+                "沈阳": "SHE",  # 桃仙机场
+                "哈尔滨": "HRB",  # 太平机场
+                "长春": "CGQ",  # 龙嘉机场
+                "长沙": "CSX",  # 黄花机场
+                "南昌": "KHN",  # 昌北机场
+                "拉萨": "LXA",  # 贡嘎机场
+                "乌鲁木齐": "URC",  # 地窝堡机场
+                "海口": "HAK",  # 美兰机场
+                "三亚": "SYX",  # 凤凰机场
+                "贵阳": "KWE",  # 龙洞堡机场
+                "银川": "INC",  # 河东机场
+                "兰州": "LHW",  # 中川机场
+                "太原": "TYN",  # 武宿机场
+                "石家庄": "SJW",  # 正定机场
+                "苏州": "SZV",  # 光福机场
+                "无锡": "WUX",  # 硕放机场
+                "宁波": "NGB",  # 栗树机场
+                "温州": "WNZ",  # 龙湾机场
+                "南通": "NTG",  # 兴东机场
+                "大理": "DLU",  # 机场
+                "丽江": "LJG",  # 三义机场
+                "威海": "WEH",  # 大水泊机场
+                "烟台": "YNT",  # 蓬莱机场
+                "唐山": "TVS",  # 三女河机场
+                "南宁": "NNG",  # 吾垩机场
+                "桂林": "KWL",  # 两江机场
+                "呆湖": "GMQ",  # 机场
+                "扬州": "YTY",  # 泰州机场
+            }
+            
+            # 如果是中文城市名，转换为机场代码
+            if dep in city_to_airport:
+                original_dep = dep
+                dep = city_to_airport[dep]
+                print(f"  🔄 转换出发地: {original_dep} → {dep}")
+            
+            if arr in city_to_airport:
+                original_arr = arr
+                arr = city_to_airport[arr]
+                print(f"  🔄 转换目的地: {original_arr} → {arr}")
+            
+            # 验证机场代码格式
+            if len(dep) != 3 or len(arr) != 3:
+                observation = f"⚠️ 航班查询失败：出发地({dep})或目的地({arr})不是有效的机场三字码，且未能自动转换。请使用火车/自驾方案。"
+                print(observation)
+                return {
+                    "flight_info": {"error": observation},
+                    "current_observation": observation,
+                    "action_history": [current_action],
+                }
+            
+            result = await manager.call_tool(
+                "flight Server",
+                "searchFlightsByDepArr",
+                dep=dep,
+                arr=arr,
+                date=date
+            )
+            observation = f"航班查询结果: {str(result)[:500]}"
+            
+            return {
+                "flight_info": str(result),
+                "current_observation": observation,
+                "action_history": [current_action],
+            }
+        
+        elif tool_name == "r1_analysis":
+            # 调用 DeepSeek R1
+            problem = params.get("problem", "")
+            context = params.get("context", {})
+            
+            # 直接调用 deep_analysis_node
+            result = await deep_analysis_node(state)
+            observation = f"R1分析完成: {result.get('reasoning_chain', '')[:500]}"
+            
+            return {
+                **result,
+                "current_observation": observation,
+                "action_history": [current_action],
+            }
+        
+        else:
+            observation = f"⚠️ 未知工具: {tool_name}"
+            print(observation)
+            return {
+                "current_observation": observation,
+                "action_history": [current_action],
+            }
+    
+    except Exception as e:
+        observation = f"❌ 工具调用失败: {tool_name}, 错误: {str(e)}"
+        print(observation)
+        import traceback
+        traceback.print_exc()
+        
+        return {
+            "current_observation": observation,
+            "action_history": [current_action],
+        }
+    
+    finally:
+        print(f"{'='*60}\n")
+
+
+async def observation_node(state: TravelPlanState) -> Dict[str, Any]:
+    """
+    ReAct 观察节点 - 评估工具调用结果
+    分析工具返回的结果，判断是否需要继续收集信息
+    """
+    print(f"\n{'='*60}")
+    print("🔍 [OBSERVATION NODE] 观察结果...")
+    print(f"{'='*60}")
+    
+    # 安全检查：如果 action 是 final_answer，直接返回完成
+    current_action = state.get("current_action", {})
+    if current_action.get("tool") == "final_answer":
+        print("✅ 检测到 final_answer，直接结束循环")
+        return {
+            "observation_history": ["信息已充分，准备生成答案"],
+            "is_complete": True,
+            "should_continue": False,
+        }
+    
+    latest_observation = state.get("current_observation", "")
+    print(f"最新观察: {latest_observation[:200]}...")
+    
+    # ========== R1模式下特殊处理 ==========
+    # 在 R1 主导模式下，不用 Qwen3 评估，直接信任 R1 的计划
+    r1_plan = state.get("r1_plan")
+    if r1_plan and 'query_plan' in r1_plan:
+        query_plan = r1_plan.get('query_plan', [])
+        iteration_count = state.get("iteration_count", 0) or 0
+        
+        print(f"  🧠 [R1模式] 进度: {iteration_count}/{len(query_plan)}")
+        
+        # 检查 action 是否标记为最后一步
+        is_last_step_marked = current_action.get("is_last_step", False)
+        if is_last_step_marked:
+            print(f"  ✅ 检测到最后一步标记，直接结束")
+            return {
+                "observation_history": ["R1计划最后一步完成"],
+                "is_complete": True,
+                "should_continue": False,
+            }
+        
+        # 优先级检查：如果 iteration_count 已达到或超过计划长度，强制结束
+        if iteration_count >= len(query_plan):
+            print(f"  ✅ iteration_count({iteration_count}) >= plan_length({len(query_plan)})，强制结束")
+            return {
+                "observation_history": ["R1计划全部完成"],
+                "is_complete": True,
+                "should_continue": False,
+            }
+        
+        # 如果还有未执行的步骤，继续
+        # 但需要从 thought_node 传递的 should_continue 判断
+        # 如果 thought 已经设置 should_continue=False，就不要覆盖
+        thought_should_continue = state.get('should_continue', True)
+        print(f"  ➡️ 计划未完成，继续执行下一步 (thought_should_continue={thought_should_continue})")
+        return {
+            "observation_history": [f"R1计划第{iteration_count}步完成"],
+            "is_complete": False,
+            "should_continue": thought_should_continue,  # 使用thought节点的判断
+        }
+    
+    # ========== 检测工具连续失败 ==========
+    # 如果当前观察包含明显的错误信息，记录失败次数
+    failed_tool_count = state.get("failed_tool_count", 0) or 0
+    observation_str = str(latest_observation).lower()
+    
+    # 检测工具调用失败的特征
+    is_tool_error = (
+        "工具调用失败" in latest_observation or
+        "mcp error" in observation_str or
+        "error" in observation_str and ("站点代码查询失败" in latest_observation or "参数（dep）不符合要求" in latest_observation) or
+        "无法查询" in latest_observation or
+        "获取工具列表失败" in latest_observation
+    )
+    
+    if is_tool_error:
+        failed_tool_count += 1
+        print(f"  ⚠️ 检测到工具失败，累计失败次数: {failed_tool_count}")
+    else:
+        # 成功调用，重置失败计数
+        failed_tool_count = 0
+    
+    # 如果连续3次工具调用失败，强制结束循环
+    if failed_tool_count >= 3:
+        print(f"  🛑 连续 {failed_tool_count} 次工具调用失败，强制结束循环")
+        return {
+            "observation_history": [f"工具调用多次失败，使用已有数据生成答案"],
+            "is_complete": True,
+            "should_continue": False,
+            "failed_tool_count": failed_tool_count,
+        }
+    
+    # 构建所有已收集信息的摘要
+    all_info = []
+    if state.get("rag_results"):
+        all_info.append("• RAG检索结果")
+    if state.get("train_info"):
+        all_info.append("• 火车票信息")
+    if state.get("driving_info"):
+        all_info.append("• 自驾路线")
+    if state.get("hotel_info"):
+        all_info.append("• 酒店信息")
+    if state.get("weather_info"):
+        all_info.append("• 天气信息")
+    if state.get("lucky_day_info"):
+        all_info.append("• 黄历信息")
+    if state.get("flight_info"):
+        all_info.append("• 航班信息")
+    
+    all_info_str = "\n".join(all_info) if all_info else "暂无信息"
+    
+    # 构造用户查询
+    user_query_parts = []
+    if state.get("destination"):
+        user_query_parts.append(f"目的地:{state['destination']}")
+    if state.get("origin"):
+        user_query_parts.append(f"出发地:{state['origin']}")
+    if state.get("travel_days"):
+        user_query_parts.append(f"{state['travel_days']}天")
+    if state.get("budget"):
+        user_query_parts.append(f"预算{state['budget']}元")
+    
+    user_query = ", ".join(user_query_parts) if user_query_parts else "未知需求"
+    
+    # 使用 REACT_OBSERVATION_PROMPT
+    prompt = REACT_OBSERVATION_PROMPT.format(
+        user_query=user_query,
+        all_collected_info=all_info_str,
+        latest_observation=latest_observation
+    )
+    
+    try:
+        response = await qwen3_llm.ainvoke([HumanMessage(content=prompt)])
+        content = response.content.strip()
+        
+        # 解析 JSON
+        if "```json" in content:
+            start = content.find("```json") + 7
+            end = content.find("```", start)
+            if end != -1:
+                content = content[start:end].strip()
+        elif "```" in content:
+            start = content.find("```") + 3
+            end = content.find("```", start)
+            if end != -1:
+                content = content[start:end].strip()
+        
+        if content.startswith("{"):
+            brace_count = 0
+            for i, char in enumerate(content):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        content = content[:i+1]
+                        break
+        
+        evaluation = json.loads(content)
+        
+        eval_text = evaluation.get("evaluation", "")
+        is_sufficient = evaluation.get("is_sufficient", False)
+        missing_info = evaluation.get("missing_info", "")
+        should_continue = evaluation.get("should_continue", True)
+        
+        print(f"\n📊 评估: {eval_text}")
+        print(f"✅ 信息充分: {is_sufficient}")
+        print(f"⚠️  缺失信息: {missing_info}")
+        print(f"➡️  继续循环: {should_continue}")
+        print(f"{'='*60}\n")
+        
+        return {
+            "observation_history": [eval_text],
+            "is_complete": is_sufficient,
+            "should_continue": should_continue and not is_sufficient,
+            "information_gaps": [missing_info] if missing_info else [],
+            "failed_tool_count": failed_tool_count,  # 传递失败计数
+        }
+    
+    except Exception as e:
+        print(f"❌ 观察节点异常: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # 失败时默认继续，但不要无限循环
+        iteration_count = state.get("iteration_count", 0) or 0
+        max_iterations = state.get("max_iterations", 8) or 8
+        
+        if iteration_count >= max_iterations - 1:
+            # 快达到最大迭代，强制结束
+            return {
+                "observation_history": [f"观察失败，已达最大迭代，结束循环"],
+                "is_complete": True,
+                "should_continue": False,
+            }
+        else:
+            return {
+                "observation_history": [f"观察失败: {str(e)}"],
+                "is_complete": False,
+                "should_continue": True,
+            }

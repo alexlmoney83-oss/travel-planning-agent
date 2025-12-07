@@ -1,6 +1,8 @@
 # 🌍 智能旅行规划助手
 
-基于 LangGraph + MCP + RAG 的 Agentic 旅行规划系统，结合多模型协作、知识检索和实时数据查询，为用户提供智能化的旅行方案。也是自己制作的一个demo小项目
+基于 **LangChain Agent + Streamlit + MCP + RAG** 的智能旅行规划系统，结合双模型协作（DeepSeek R1 + Qwen3）、知识检索和实时数据查询，为用户提供智能化的旅行方案。
+
+> **架构升级**: 已从 LangGraph 迁移到 **LangChain Agent**，无递归限制，支持复杂多目的地行程规划。
 
 ## 📋 目录
 
@@ -19,7 +21,7 @@
 
 ## 🎯 项目简介
 
-这是一个智能旅行规划系统，由 Python 后端（`aggentic_RAG`）和 Next.js 前端（`travel-chat-ui`）组成，通过自然语言对话为用户生成完整的旅行方案。
+这是一个智能旅行规划系统，采用 **Streamlit UI + LangChain Agent** 架构，通过自然语言对话为用户生成完整的旅行方案。系统支持简单查询和复杂行程规划两种模式，根据场景复杂度自动选择合适的处理路径。
 
 ### 主要特性
 
@@ -27,14 +29,18 @@
   - 🔍 **简单查询模式**：只需目的地，快速获取景点推荐
   - 🎯 **完整规划模式**：提供详细信息，生成含交通、住宿、天气、黄历的完整方案
 
-- **多模型协作**：
-  - **DeepSeek R1**：处理复杂推理和优化问题（预算优化、路线规划）
-  - **Qwen3**：负责信息提取和普通对话
+- **双模型协作**：
+  - **DeepSeek R1**：处理复杂推理和多目的地路线优化（预算分配、时间安排）
+  - **Qwen3**：负责信息提取、工具调用决策和方案生成
+  - 系统根据场景复杂度自动选择 R1 主导或 Qwen3 主导模式
 
-- **实时数据集成**：
-  - 🚄 12306 火车票查询
-  - 🗺️ 高德地图（导航、酒店、天气、POI 搜索）
-  - 📅 八字黄历服务器（查询出行吉日）
+- **实时数据集成** (基于 MCP 协议)：
+  - 🚄 12306 火车票查询（自动获取站点代码，查询车次时刻表）
+  - 🚗 高德地图自驾路线（自动计算距离、时间、过路费）
+  - 🏨 高德地图酒店搜索（根据预算自动筛选）
+  - ☀️ 高德地图天气预报（支持多日预报）
+  - 📅 八字黄历查询（农历、宜忌、吉日）
+  - ✈️ 航班查询（可选，长途>800km 自动触发）
 
 - **知识库检索**：
   - RAG 向量数据库存储旅游攻略
@@ -78,46 +84,56 @@
 ### 后端架构 (`aggentic_RAG`)
 
 ```
-LangGraph Workflow
-├── planner_node          # 信息提取（Qwen3）
-├── route_after_plan      # 模式路由（简单/完整）
-├── rag_search_node       # RAG 检索 + 酒店查询
-├── route_after_rag       # 跳过不需要的节点
-├── train_query_node      # 12306 火车票查询
-├── lucky_day_query_node  # 黄历吉日查询
-├── weather_query_node    # 天气预报查询
-├── r1_analysis_node      # DeepSeek R1 深度分析（按需）
-└── synthesizer_node      # 方案合成（Qwen3）
+LangChain Agent + 预分析层
+├── pre_analyze_query         # 预分析（场景检测、多目的地识别）
+│   ├── simple_query          # 简单查询：只需景点信息
+│   ├── complex_query         # 复杂查询：特殊需求、预算紧张
+│   └── multi_destination     # 多目的地：2个以上城市
+│
+├── [R1主导模式]              # 复杂/多目的地场景
+│   ├── r1_strategy_node      # R1分解行程、制定query_plan
+│   ├── ReAct Loop            # 按query_plan执行工具调用
+│   │   ├── train_query       # 12306查询（自动附带自驾路线）
+│   │   ├── gaode_weather     # 天气查询
+│   │   ├── gaode_hotel       # 酒店搜索
+│   │   ├── lucky_day         # 黄历查询
+│   │   └── flight_query      # 航班查询（条件触发）
+│   ├── r1_optimization       # R1二次优化（仅单目的地）
+│   └── synthesizer_node      # 生成最终方案
+│
+└── [Qwen3主导模式]           # 简单场景
+    ├── ReAct Loop            # Qwen3自主决策调用工具
+    └── synthesizer_node      # 生成最终方案
 ```
+
+**关键特性**:
+- ✅ **无递归限制**: 从 LangGraph 迁移到 LangChain Agent，支持任意长度的query_plan
+- ✅ **自动重试**: MCP工具调用失败自动重试2次（SSE连接保护）
+- ✅ **超时保护**: 12306查询90秒超时，防止长时间阻塞
+- ✅ **错误恢复**: 单个工具失败不影响整体流程
 
 ### 核心技术栈
 
 **后端**：
-- **LangGraph**：工作流编排
-- **LangChain**：LLM 抽象层
-- **ChromaDB**：向量数据库（存储 RAG 数据）
-- **DashScope**：阿里云模型服务（Qwen3、文本嵌入）
-- **DeepSeek API**：复杂推理模型
-- **MCP**：模型上下文协议（12306、高德地图、八字服务器）
-
-**前端**：
-- **Next.js 15**：React 框架
-- **Tailwind CSS**：样式
-- **LangGraph SDK**：流式响应
-- **Turbo**：Monorepo 构建工具
+- **LangChain Agent**: 核心Agent执行引擎（ReAct模式）
+- **Streamlit**: Web UI 界面
+- **ChromaDB**: 向量数据库（存储旅游攻略）
+- **DashScope**: 阿里云模型服务（Qwen3-plus + text-embedding-v3）
+- **DeepSeek API**: 深度推理模型（deepseek-reasoner）
+- **MCP (Model Context Protocol)**: 外部工具集成
+  - 12306 Server（火车票）
+  - Gaode Server（地图、天气、酒店）
+  - Bazi Server（黄历）
+  - Flight Server（航班，可选）
 
 ---
 
 ## 💻 系统要求
 
-### 后端
+### 运行环境
 - Python >= 3.11
-- 8GB+ RAM（用于向量数据库）
+- 8GB+ RAM（用于向量数据库和模型推理）
 - Windows/Linux/macOS
-
-### 前端
-- Node.js >= 18
-- pnpm >= 10.6.3
 
 ### API 密钥
 - **DeepSeek API Key**（用于 DeepSeek R1 模型）
@@ -217,6 +233,7 @@ cd "agentic RAG"
 
 #### 2.1 安装依赖
 
+**推荐方式**（支持开发模式，方便调试）：
 ```bash
 cd aggentic_RAG
 pip install -e .
@@ -227,6 +244,8 @@ pip install -e .
 ```bash
 pip install -r requirements.txt
 ```
+
+> **说明**：虽然 `app.py` 会自动添加模块路径，但 `pip install -e .` 能让其他工具脚本（如 `check_mcp_health.py`）正常运行，并支持开发模式下的代码热重载。
 
 #### 2.2 配置环境变量
 
@@ -295,47 +314,46 @@ CHROMA_PERSIST_DIR=./data/travel_vectordb
 
 将 URL 替换为你获取的真实 MCP 服务器地址。
 
-#### 2.4 启动后端服务
+#### 2.4 启动应用
+
+在项目根目录运行:
 
 ```bash
-langgraph dev
+streamlit run app.py
 ```
 
-后端将在 `http://localhost:2024` 启动。
+应用将在 `http://localhost:8501` 启动。
 
 **验证安装**：
-- 启动成功后，访问 `http://localhost:2024/ok` 应返回 `{"status": "ok"}`
-- 检查日志确认 MCP 服务器连接成功
+- 启动成功后，浏览器会自动打开 Streamlit UI
+- 在侧边栏可以查看已加载的工具列表
+- 后台日志会显示 MCP 服务器连接状态
 
-### 3. 前端安装
+### 3. 使用健康检查工具（可选）
 
-#### 3.1 安装依赖
-
-```bash
-cd travel-chat-ui
-pnpm install
-```
-
-#### 3.2 配置环境变量
-
-编辑 `.env` 文件：
+检查所有 MCP 服务器连接状态:
 
 ```bash
-# LangGraph 后端 URL
-LANGGRAPH_API_URL=http://localhost:2024
+python check_mcp_health.py
 ```
 
-#### 3.3 启动前端服务
-
-```bash
-pnpm dev
+输出示例:
 ```
+🔍 MCP 服务器健康检查
+============================================================
 
-前端将在 `http://localhost:3000` 启动。
+🔧 12306 Server
+   状态: ✅ 正常
+   工具数: 3
+   示例工具: get-tickets, get-stations-code-in-city, ...
 
-### 4. 访问应用
+🔧 Gaode Server
+   状态: ✅ 正常
+   工具数: 5
+   ...
 
-打开浏览器访问 `http://localhost:3000`，即可开始使用智能旅行规划助手。
+✅ 所有 MCP 服务器状态正常！
+```
 
 ---
 
@@ -425,16 +443,22 @@ pnpm dev
 
 #### 如何验证 R1 是否被调用？
 
-查看后端日志：
-
-```bash
-langgraph dev --verbose
-```
+查看 Streamlit 后台日志（运行 `streamlit run app.py` 的终端窗口）：
 
 如果看到以下日志，说明 R1 被调用了：
 ```
-⚙️  [planner_node] needs_deep_analysis=True
-🧠 [r1_analysis_node] 调用 DeepSeek R1 进行深度分析...
+📊 预分析结果: {..., 'needs_deep_analysis': True, ...}
+🌍 检测到多目的地场景: comma_separated_2
+
+🧠 R1 主导模式: multi_destination
+
+🧠 [r1_analysis] 深度分析调用: 用户计划于...
+  R1分析完成，返回 1771 字符
+```
+
+或者在 Streamlit UI 中看到：
+```
+🌍 检测到多目的地行程，将调用深度路线优化...
 ```
 
 #### R1 调用示例
@@ -473,47 +497,68 @@ aggentic_RAG/data/travel_vectordb/
 
 ### 导入数据
 
-#### 1. 准备文档
+本项目提供 **两种** 文档导入方式：
 
-将旅游攻略文档放入 `data/travel_docs/` 目录：
+#### 方式1：Streamlit UI 上传（推荐）
 
-```bash
-cd aggentic_RAG
-mkdir -p data/travel_docs
-```
+1. 启动应用：`streamlit run app.py`
+2. 在左侧边栏找到 **"📚 知识库管理"** 区域
+3. 点击 **"上传文件"** 按钮，选择文档
+4. 系统自动完成:
+   - ✅ 文件上传到 `data/travel_docs/`
+   - ✅ 文本分块处理
+   - ✅ 向量化并存入 ChromaDB
+   - ✅ 实时显示处理进度
 
-支持的格式：
+**支持的格式**：
 - `.txt` - 纯文本
 - `.md` - Markdown
 - `.pdf` - PDF 文档
 - `.csv` - CSV 表格
 
-#### 2. 批量导入
+**优点**：
+- 🎯 简单直观，无需写代码
+- 📊 实时反馈处理状态
+- 🔄 自动去重（基于 UUID）
 
-打开 Python REPL：
+#### 方式2：命令行批量导入（适合大量文档）
 
-```bash
-python
-```
+1. 将旅游攻略文档放入 `data/travel_docs/` 目录：
+   ```bash
+   cd aggentic_RAG
+   mkdir -p data/travel_docs
+   # 复制你的文档到 data/travel_docs/
+   ```
 
-执行导入脚本：
+2. 打开 Python REPL：
+   ```bash
+   python
+   ```
 
-```python
-from travel_agent.tools.rag_tool import TravelRAGTool
+3. 执行导入脚本：
+   ```python
+   from travel_agent.tools.rag_tool import TravelRAGTool
+   
+   # 创建 RAG 工具实例
+   rag_tool = TravelRAGTool()
+   
+   # 导入数据（自动生成向量）
+   rag_tool.build_knowledge_base(
+       data_dir="./data/travel_docs",
+       force_recreate=False  # False=追加模式，True=重建数据库
+   )
+   
+   print("数据导入完成！")
+   ```
 
-# 创建 RAG 工具实例
-rag_tool = TravelRAGTool()
+**优点**：
+- 📦 适合批量处理数百上千个文档
+- ⚙️ 支持自定义分块参数
+- 📄 适合脚本化和自动化场景
 
-# 导入数据（自动生成向量）
-rag_tool.build_knowledge_base(
-    data_dir="./data/travel_docs",
-    force_recreate=False  # False=追加模式，True=重建数据库
-)
+---
 
-print("数据导入完成！")
-```
-
-#### 3. 自定义分块参数（可选）
+### 自定义分块参数（可选）
 
 ```python
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -594,103 +639,86 @@ UUID = MD5(f"{source_file}:{chunk_index}:{content[:100]}")
 ## 📁 项目结构
 
 ```
-agentic RAG/
-├── aggentic_RAG/                 # Python 后端
+travel-planning-agent/
+├── aggentic_RAG/                 # Python 后端包
 │   ├── travel_agent/             # 主应用代码
 │   │   ├── config/               # 配置文件
-│   │   │   ├── prompts.py        # Prompt 模板
-│   │   │   ├── settings.py       # 全局配置
+│   │   │   ├── prompts.py        # Prompt 模板（Planner, Synthesizer, R1）
+│   │   │   ├── settings.py       # 全局配置（路径、参数）
 │   │   │   └── servers_config.json  # MCP 服务器配置
-│   │   ├── graph/                # LangGraph 工作流
-│   │   │   ├── workflow.py       # 主工作流定义
-│   │   │   ├── state.py          # 状态管理
-│   │   │   └── nodes.py          # 节点实现
-│   │   ├── models/               # 模型封装
-│   │   │   ├── llm.py            # Qwen3 模型
-│   │   │   └── deepseek_r1.py   # DeepSeek R1 模型
-│   │   ├── tools/                # 工具集成
+│   │   ├── core/                 # 核心模块
+│   │   │   └── agent_executor.py # Agent执行引擎（已备用）
+│   │   ├── graph/                # 工作流节点（保留兼容LangGraph）
+│   │   │   ├── workflow.py       # LangGraph工作流定义（已备用）
+│   │   │   ├── state.py          # 状态类型定义
+│   │   │   └── nodes.py          # 所有节点实现（planner, R1, tools, synthesizer）
+│   │   ├── tools/                # 工具集
 │   │   │   ├── rag_tool.py       # RAG 向量检索
-│   │   │   └── mcp_tools.py      # MCP 工具调用
-│   │   └── app.py                # FastAPI 服务器
+│   │   │   ├── mcp_tools.py      # MCP 工具管理器（带重试机制）
+│   │   │   ├── r1_tool.py        # DeepSeek R1 封装
+│   │   │   └── tool_registry.py  # 工具注册表（所有工具定义）
+│   │   └── app.py                # Agent入口（已备用）
 │   ├── data/                     # 数据目录
 │   │   ├── travel_docs/          # 旅游攻略文档
 │   │   └── travel_vectordb/      # ChromaDB 向量数据库
 │   ├── .env                      # 环境变量
 │   ├── requirements.txt          # Python 依赖
-│   ├── setup.py                  # 安装脚本
-│   └── langgraph.json            # LangGraph 配置
+│   └── setup.py                  # 安装脚本
 │
-├── travel-chat-ui/               # Next.js 前端
-│   ├── apps/                     # 应用目录
-│   │   ├── web/                  # Web 前端
-│   │   │   ├── src/
-│   │   │   │   ├── components/   # React 组件
-│   │   │   │   │   └── thread/   # 对话线程组件
-│   │   │   │   ├── app/          # Next.js 页面
-│   │   │   │   └── providers/    # Context Providers
-│   │   │   └── package.json
-│   │   └── agents/               # Agent 相关代码
-│   ├── .env                      # 环境变量
-│   ├── package.json              # 项目配置
-│   ├── pnpm-workspace.yaml       # pnpm 工作区配置
-│   └── turbo.json                # Turbo 配置
-│
-└── README.md                     # 本文档
+├── app.py                        # ✅ Streamlit UI（主入口）
+├── check_mcp_health.py           # ✅ MCP 健康检查工具
+├── README.md                     # 项目文档
+├── LICENSE                       # MIT 许可证
+├── .gitignore                    # Git 忽略配置
+└── .gitattributes                # Git 属性配置
 ```
+
+**核心文件说明**:
+- `app.py`: Streamlit UI 主程序，包含预分析层和 Agent 创建
+- `nodes.py`: 所有节点实现（planner, r1_strategy, train_query, synthesizer 等）
+- `mcp_tools.py`: MCP 工具管理器，带自动重试和超时保护
+- `tool_registry.py`: 所有可用工具的定义和描述
+- `prompts.py`: 所有 LLM Prompt 模板
 
 ---
 
-## 🔌 API 接口
+## 📝 使用方式
 
-### 后端 API
+### Streamlit UI 界面
 
-**基础 URL**: `http://localhost:2024`
+启动应用后，浏览器自动打开 `http://localhost:8501`：
 
-#### 1. 创建新对话
+1. **主界面**: 聊天对话窗口
+2. **侧边栏**:
+   - 📚 上传旅游攻略文档（可选）
+   - ⚙️ 系统配置（最大迭代次数）
+   - 🧰 查看工具列表
+   - 🗑️ 清空聊天记录
 
-```http
-POST /threads
-Content-Type: application/json
+3. **对话示例**:
+   ```
+   用户：我想12月18日从上海出发，去徐州和青岛旅游3天，预算1500元
+   
+   系统：🌍 检测到多目的地行程，将调用深度路线优化...
+   🚄 正在查询交通信息...
+   ☀️ 正在查询天气预报...
+   🏨 正在搜索酒店...
+   
+   [详细的旅行方案]
+   ```
 
-{}
+### 命令行工具
+
+#### MCP 健康检查
+```bash
+python check_mcp_health.py
 ```
 
-**响应**:
-```json
-{
-  "thread_id": "uuid-string"
-}
-```
-
-#### 2. 发送消息（流式）
-
-```http
-POST /threads/{thread_id}/runs/stream
-Content-Type: application/json
-
-{
-  "assistant_id": "travel_agent",
-  "input": {
-    "messages": [
-      {
-        "type": "human",
-        "content": "我想从上海去苏州玩2天"
-      }
-    ]
-  },
-  "stream_mode": ["values"]
-}
-```
-
-**响应**（Server-Sent Events）:
-```
-data: {"event": "values", "data": {...}}
-```
-
-#### 3. 获取对话历史
-
-```http
-GET /threads/{thread_id}/history
+#### 导入旅游攻略到 RAG
+```python
+from aggentic_RAG.travel_agent.tools.rag_tool import TravelRAGTool
+rag = TravelRAGTool()
+rag.build_knowledge_base("./aggentic_RAG/data/travel_docs")
 ```
 
 ---
@@ -725,20 +753,22 @@ rag.build_knowledge_base("./data/travel_docs")
 **解决**：
 1. 检查 MCP 服务器是否启动
 2. 验证 `servers_config.json` 配置
-3. 查看后端日志
+3. 运行健康检查工具
 
 ```bash
-langgraph dev --verbose
+python check_mcp_health.py
 ```
 
-### 4. 前端连接失败
+4. 查看 Streamlit 后台日志（终端窗口）
 
-**问题**：前端显示 "Connection Error"
+### 4. Streamlit 启动失败
+
+**问题**：Streamlit 无法启动或报错
 
 **解决**：
-1. 确认后端已启动（`http://localhost:2024`）
-2. 检查前端 `.env` 中的 `LANGGRAPH_API_URL`
-3. 检查防火墙/代理设置
+1. 确认已安装 Streamlit: `pip install streamlit`
+2. 检查端口 8501 是否被占用
+3. 尝试指定端口：`streamlit run app.py --server.port 8502`
 
 ### 5. DeepSeek R1 调用失败
 
@@ -781,20 +811,45 @@ RAG_TOP_K = 5
 LLM_TEMPERATURE = 0.7
 ```
 
-### 添加新节点
+### 添加新工具
 
-1. 在 `nodes.py` 中定义节点函数：
+1. 在 `tool_registry.py` 中添加工具定义：
 ```python
-def my_new_node(state: TravelPlanState) -> TravelPlanState:
+ToolDefinition(
+    name="my_new_tool",
+    description="新工具的功能描述",
+    parameters={
+        "type": "object",
+        "properties": {
+            "param1": {
+                "type": "string",
+                "description": "参数说明"
+            }
+        },
+        "required": ["param1"]
+    },
+    tool_type="mcp",  # 或 "r1", "special"
+    server_name="Your Server",
+    mcp_tool_name="tool_name_in_mcp"
+)
+```
+
+2. 如果需要自定义处理逻辑，在 `app.py` 中添加工具处理函数
+
+### 添加新节点（高级）
+
+在 `nodes.py` 中添加新的处理节点：
+```python
+async def my_custom_node(state: TravelPlanState) -> Dict[str, Any]:
+    """自定义节点逻辑"""
     # 处理逻辑
-    return state
+    return {
+        "custom_field": "result",
+        "messages": [AIMessage(content="处理完成")]
+    }
 ```
 
-2. 在 `workflow.py` 中注册节点：
-```python
-travel_workflow.add_node("my_new_node", my_new_node)
-travel_workflow.add_edge("previous_node", "my_new_node")
-```
+**注意**: 当前系统使用 LangChain Agent，不需要手动编排节点。Agent 会自动决定调用顺序。
 
 ---
 

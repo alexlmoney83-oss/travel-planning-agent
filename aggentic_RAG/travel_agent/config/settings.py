@@ -39,6 +39,7 @@ CHROMA_PERSIST_DIR = PROJECT_ROOT / "data" / "travel_vectordb"
 RAG_CHUNK_SIZE = 500
 RAG_CHUNK_OVERLAP = 50
 RAG_SEARCH_K = 3
+RAG_BATCH_SIZE = 10  # ChromaDB批量载入大小，如遇到API限制可调小
 
 # MCP配置
 _mcp_path_env = os.getenv("MCP_CONFIG_PATH", "travel_agent/config/servers_config.json")

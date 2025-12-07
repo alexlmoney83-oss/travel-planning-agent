@@ -4,12 +4,41 @@ MCP工具封装 - 基于client.py实现
 from langchain.tools import Tool
 from typing import Optional, Dict, Any, List
 from contextlib import AsyncExitStack
-from agents.mcp import MCPServerSse
 import json
 import os
 import ssl
 import httpx
 from pathlib import Path
+import sys
+import warnings
+
+# suppress async generator warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*async_generator.*')
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='.*generator didn\'t stop.*')
+
+# 尝试导入agents.mcp，如果失败提供详细错误
+try:
+    from agents.mcp import MCPServerSse
+except ImportError as e:
+    print(f"\n❌ 导入agents.mcp失败: {e}")
+    print(f"🔍 Python解释器: {sys.executable}")
+    print(f"🔍 sys.path前5项:")
+    for i, p in enumerate(sys.path[:5]):
+        print(f"  {i+1}. {p}")
+    
+    # 尝试查找agents包是否存在
+    try:
+        import agents
+        print(f"✅ agents包找到: {agents.__file__}")
+        print(f"❌ 但agents.mcp模块不存在")
+    except ImportError:
+        print(f"❌ agents包未安装")
+    
+    raise ImportError(
+        f"\n\nopenai-agents包未正确安装或agents.mcp模块不可用\n"
+        f"Python: {sys.executable}\n"
+        f"请运行: pip install openai-agents"
+    ) from e
 
 from ..config.settings import PROJECT_ROOT, MCP_CONFIG_PATH
 
@@ -19,7 +48,11 @@ os.environ['NO_PROXY'] = os.environ.get('NO_PROXY', '') + ',modelscope.net,api-i
 # 创建不验证SSL的httpx客户端（仅用于开发/测试）
 def create_insecure_httpx_client():
     """创建禁用SSL验证的httpx客户端"""
-    return httpx.AsyncClient(verify=False, timeout=30.0)
+    return httpx.AsyncClient(
+        verify=False, 
+        timeout=60.0,  # 增加超时时间到60秒
+        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)  # 增加连接池
+    )
 
 
 class MCPToolManager:
@@ -53,55 +86,99 @@ class MCPToolManager:
                     MCPServerSse(name=name, params={"url": url})
                 )
                 self.mcp_servers[name] = server
-                print(f"✅ 已连接MCP服务器: {name}")
-                
-                # 列出可用工具
-                try:
-                    tools = await self.list_tools(name)
-                    print(f"   可用工具: {', '.join(tools) if tools else '无'}")
-                except Exception as e:
-                    print(f"   ⚠️ 无法获取工具列表: {e}")
+                # 静默模式，不输出连接日志
             except Exception as e:
-                print(f"❌ 连接失败 {name}: {e}")
+                # 静默失败，不输出错误
+                pass
     
-    async def call_tool(self, server_name: str, tool_name: str, **kwargs) -> str:
-        """调用MCP工具"""
+    async def call_tool(self, server_name: str, tool_name: str, max_retries: int = 2, **kwargs) -> str:
+        """
+        调用MCP工具，带重试机制
+        
+        Args:
+            server_name: MCP服务器名称
+            tool_name: 工具名称
+            max_retries: 最大重试次数（默认2次）
+            **kwargs: 工具参数
+        """
         if server_name not in self.mcp_servers:
             return json.dumps({
                 "error": f"MCP服务器 {server_name} 未连接",
                 "available_servers": list(self.mcp_servers.keys())
             }, ensure_ascii=False)
         
-        try:
-            result = await self.mcp_servers[server_name].call_tool(
-                tool_name, 
-                arguments=kwargs
-            )
-            
-            # 处理MCP返回的CallToolResult对象
-            if hasattr(result, 'content'):
-                # 提取content字段
-                content = result.content
-                if isinstance(content, list) and len(content) > 0:
-                    # 如果content是列表，提取第一个元素的text
-                    if hasattr(content[0], 'text'):
-                        return content[0].text
-                    else:
-                        return str(content[0])
-                elif isinstance(content, str):
-                    return content
-                else:
-                    return json.dumps(content, ensure_ascii=False, indent=2)
-            else:
-                # 如果没有content属性，尝试直接序列化
-                return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+        import asyncio
+        last_error = None
+        
+        # 重试逻辑
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt > 0:
+                    print(f"  🔄 第{attempt}次重试 {server_name}.{tool_name}...")
+                    await asyncio.sleep(1 * attempt)  # 指数退避: 1s, 2s
                 
-        except Exception as e:
-            return json.dumps({
-                "error": f"工具调用失败: {str(e)}",
-                "server": server_name,
-                "tool": tool_name
-            }, ensure_ascii=False)
+                result = await self.mcp_servers[server_name].call_tool(
+                    tool_name, 
+                    arguments=kwargs
+                )
+                
+                # 处理MCP返回的CallToolResult对象
+                if hasattr(result, 'content'):
+                    # 提取content字段
+                    content = result.content
+                    if isinstance(content, list) and len(content) > 0:
+                        # 如果content是列表，提取第一个元素的text
+                        if hasattr(content[0], 'text'):
+                            return content[0].text
+                        else:
+                            return str(content[0])
+                    elif isinstance(content, str):
+                        return content
+                    else:
+                        return json.dumps(content, ensure_ascii=False, indent=2)
+                else:
+                    # 如果没有content属性，尝试直接序列化
+                    return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+                    
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                
+                # 判断是否是SSE连接中断错误，可重试
+                is_retryable = any([
+                    "peer closed connection" in error_str,
+                    "incomplete chunked read" in error_str,
+                    "remoteprotocolerror" in error_str,
+                    "timeout" in error_str,
+                    "connection reset" in error_str
+                ])
+                
+                if is_retryable and attempt < max_retries:
+                    print(f"  ⚠️ [MCP错误] {server_name}.{tool_name} - {type(e).__name__}")
+                    print(f"     原因: SSE连接中断，将重试...")
+                    continue  # 重试
+                else:
+                    # 不可重试或已达最大重试次数
+                    break
+        
+        # 所有重试均失败，记录错误
+        import traceback
+        error_msg = f"工具调用失败: {str(last_error)}"
+        print(f"\n❌ [MCP错误] {server_name}.{tool_name} (重试{max_retries}次后仍失败)")
+        print(f"   错误: {str(last_error)}")
+        print(f"   类型: {type(last_error).__name__}")
+        if "peer closed" in str(last_error).lower():
+            print(f"   原因: SSE连接中断，可能是MCP Server负载过高或返回数据过大")
+        elif "timeout" in str(last_error).lower():
+            print(f"   原因: 网络超时，请检查MCP服务器是否正常运行")
+        
+        return json.dumps({
+            "error": error_msg,
+            "server": server_name,
+            "tool": tool_name,
+            "error_type": type(last_error).__name__,
+            "retries": max_retries
+        }, ensure_ascii=False)
     
     async def list_tools(self, server_name: str) -> List[str]:
         """列出指定服务器的可用工具"""
@@ -130,9 +207,9 @@ class MCPToolManager:
         if self.exit_stack:
             try:
                 await self.exit_stack.aclose()
-                print("✅ MCP连接已关闭")
-            except Exception as e:
-                print(f"⚠️ MCP清理警告: {e}")
+            except Exception:
+                # 静默忽略清理错误
+                pass
 
 
 # 全局MCP管理器实例

@@ -2,23 +2,23 @@
     "mcp_servers": [
         {
             "name": "12306 Server",
-            "url": "填入你的URL"
+            "url": ""
         },
         {
             "name": "Gaode Server",
-            "url": "填入你的URL"
+            "url": ""
         },
         {
             "name": "biying Server",
-            "url": "填入你的URL"
+            "url": ""
         },
         {
             "name": "bazi Server",
-            "url": "填入你的URL"
+            "url": ""
         },
         {
             "name": "flight Server",
-            "url": "填入你的URL"
+            "url": ""
         }
     ],
     "agent": {

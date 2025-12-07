@@ -26,18 +26,53 @@ async def run_travel_agent(user_query: str):
         "budget": None,
         "travel_date": None,
         "preferences": None,
+        
+        # 单次结果（旧模式，向后兼容）
         "rag_results": None,
         "train_info": None,
         "weather_info": None,
+        "hotel_info": None,
+        "driving_info": None,
+        "lucky_day_info": None,
+        
+        # R1 分析
         "reasoning_chain": None,
         "optimization_suggestions": None,
         "needs_deep_analysis": False,
         "tools_needed": None,
+        
+        # ReAct 循环状态
+        "iteration_count": 0,
+        "max_iterations": 8,
+        "current_thought": None,
+        "current_action": None,
+        "current_observation": None,
+        "should_continue": True,
+        "is_complete": False,
+        
+        # ReAct 累积历史（列表）
+        "thought_history": [],
+        "action_history": [],
+        "observation_history": [],
+        "rag_results_history": [],
+        "tool_results_history": [],
+        
+        # ReAct 工具管理
+        "available_tools": None,
+        "tool_call_count": {},
+        "information_gaps": [],
+        
+        # 最终输出
         "travel_plan": None,
     }
     
     # 运行工作流
-    result = await travel_workflow.ainvoke(initial_state)
+    # 设置 recursion_limit=100 以支持复杂的多目的地场景
+    # 8步计划 × 3节点/步 = 24, 再加上其他节点，需要更大的限制
+    result = await travel_workflow.ainvoke(
+        initial_state,
+        config={"recursion_limit": 100}
+    )
     
     return result
 

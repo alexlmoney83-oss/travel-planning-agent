@@ -19,6 +19,7 @@ from ..config.settings import (
     RAG_CHUNK_SIZE,
     RAG_CHUNK_OVERLAP,
     RAG_SEARCH_K,
+    RAG_BATCH_SIZE,
 )
 
 
@@ -279,8 +280,8 @@ class TravelRAG:
         
         print(f"📊 正在创建向量数据库...")
         
-        # 批量处理
-        batch_size = 100
+        # 批量处理，使用配置的batch_size
+        batch_size = RAG_BATCH_SIZE
         for i in range(0, len(split_docs), batch_size):
             batch = split_docs[i:i+batch_size]
             batch_ids = doc_ids[i:i+batch_size]

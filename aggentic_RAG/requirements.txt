@@ -1,10 +1,22 @@
+# LangChain 核心依赖
 langchain>=0.3.0
-langgraph>=0.2.0
 langchain-openai>=0.2.0
 langchain-community>=0.3.0
 langchain-chroma>=0.1.0
-dashscope>=1.20.0
+
+# 向量数据库
 chromadb>=0.5.0
-python-dotenv>=1.0.0
-openai-agents>=0.1.0
+
+# LLM 提供商
+dashscope>=1.20.0  # Qwen
+openai>=1.0.0      # OpenAI API兼容
+
+# MCP 工具
 mcp>=0.1.0
+
+# UI 框架
+streamlit>=1.28.0
+
+# 其他
+python-dotenv>=1.0.0
+pydantic>=2.0.0
