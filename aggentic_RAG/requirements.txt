@@ -13,6 +13,7 @@ openai>=1.0.0      # OpenAI API兼容
 
 # MCP 工具
 mcp>=0.1.0
+openai-agents>=0.1.0  # mcp_tools.py: from agents.mcp import MCPServerSse（缺失会导致安装后无法运行）
 
 # UI 框架
 streamlit>=1.28.0
