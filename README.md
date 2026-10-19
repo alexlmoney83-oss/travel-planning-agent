@@ -4,6 +4,16 @@
 
 > **架构升级**: 已从 LangGraph 迁移到 **LangChain Agent**，无递归限制，支持复杂多目的地行程规划。
 
+> ### 🔀 Fork 说明
+> 本仓库 fork 自 [alexlmoney83-oss/travel-planning-agent](https://github.com/alexlmoney83-oss/travel-planning-agent)，原项目采用 MIT 协议，感谢原作者的开源贡献。
+>
+> 本 fork 在原项目基础上的改动：
+> 1. **修复依赖声明缺失**：`aggentic_RAG/requirements.txt` 补充 `openai-agents` —— 原文件缺失该依赖，而 `tools/mcp_tools.py` 中 `from agents.mcp import MCPServerSse` 依赖它，导致按 README 执行 `pip install -r requirements.txt` 后项目无法启动（`setup.py` 中已有声明，属 requirements.txt 遗漏）；
+> 2. **MCP 连接诊断增强**：原 `MCPToolManager.initialize()` 捕获连接异常后静默 `pass`，服务不可用时无从排查。现改为打印「服务器名 + 异常类型 + 原因」，并新增 `get_health()` 返回连接/失败清单，配合 `check_mcp_health.py` 定位问题；
+> 3. **新增源码研读笔记**（见 `docs/`）：项目结构分析、调用链梳理与已知问题清单（graph/ 废弃代码仍被 core/agent_executor.py 引用、servers_config.json 示例端点为空等），供后续维护参考。
+>
+> 详细改动请查看本 fork 相对上游的 [commit 记录](https://github.com/ZX1aoF/travel-planning-agent/commits/main)。
+
 ## 📋 目录
 
 - [项目简介](#项目简介)
@@ -760,6 +770,23 @@ python check_mcp_health.py
 ```
 
 4. 查看 Streamlit 后台日志（终端窗口）
+
+**本 fork 新增**：连接失败时会打印明确的告警（服务器名 + 异常类型及原因），而不是静默跳过：
+
+```
+⚠️ 警告: MCP 服务器 Gaode Server 连接失败，已跳过 → ConnectError: peer closed connection
+```
+
+也可以在代码中直接查询健康状态：
+
+```python
+from travel_agent.tools.mcp_tools import MCPToolManager
+
+manager = MCPToolManager()
+# ... await manager.initialize() 之后
+print(manager.get_health())
+# {'connected': ['12306 Server'], 'failed': {'Gaode Server': 'ConnectError: ...'}, 'total': 5}
+```
 
 ### 4. Streamlit 启动失败
 

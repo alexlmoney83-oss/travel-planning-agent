@@ -62,25 +62,30 @@ class MCPToolManager:
         self.config_path = config_path or MCP_CONFIG_PATH
         self.mcp_servers = {}
         self.exit_stack = None
-        
+        # 记录连接失败的服务器及原因，便于排查（原实现失败后静默忽略）
+        self.failed_servers: Dict[str, str] = {}
+
     async def initialize(self):
         """初始化所有MCP服务器连接"""
         if not os.path.exists(self.config_path):
             raise FileNotFoundError(f"MCP配置文件不存在: {self.config_path}")
-        
+
         with open(self.config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
-        
+
+        # 重复初始化（如配置热更新后重连）时清空上一轮状态，避免旧失败记录残留
+        self.failed_servers.clear()
         self.exit_stack = AsyncExitStack()
-        
+
         for server_conf in config.get("mcp_servers", []):
             name = server_conf.get("name")
             url = server_conf.get("url")
-            
+
             if not url:
-                print(f"⚠️ 警告: 服务器 {name} 缺少URL，跳过")
+                print(f"⚠️ 警告: 服务器 {name} 缺少URL，跳过（请在 servers_config.json 中配置）")
+                self.failed_servers[name] = "URL 未配置"
                 continue
-            
+
             try:
                 server = await self.exit_stack.enter_async_context(
                     MCPServerSse(name=name, params={"url": url})
@@ -88,9 +93,19 @@ class MCPToolManager:
                 self.mcp_servers[name] = server
                 # 静默模式，不输出连接日志
             except Exception as e:
-                # 静默失败，不输出错误
-                pass
-    
+                # 记录失败原因而不是静默忽略：MCP 连接失败时上层仍可降级运行，
+                # 但需要能通过 get_health() 看到「哪个服务、因为什么」不可用。
+                self.failed_servers[name] = f"{type(e).__name__}: {e}"
+                print(f"⚠️ 警告: MCP 服务器 {name} 连接失败，已跳过 → {type(e).__name__}: {e}")
+
+    def get_health(self) -> Dict[str, Any]:
+        """返回当前 MCP 连接健康状态，供 UI / 健康检查脚本展示"""
+        return {
+            "connected": sorted(self.mcp_servers.keys()),
+            "failed": dict(self.failed_servers),
+            "total": len(self.mcp_servers) + len(self.failed_servers),
+        }
+
     async def call_tool(self, server_name: str, tool_name: str, max_retries: int = 2, **kwargs) -> str:
         """
         调用MCP工具，带重试机制
